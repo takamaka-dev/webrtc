@@ -209,6 +209,61 @@ static ScopedJavaLocalRef<jstring> JNI_SFrameKeyStore_GetStatsJson(
   return NativeToJavaString(env, j + "]");
 }
 
+static ScopedJavaLocalRef<jbyteArray> JNI_SFrameKeyStore_VectorSeal(
+    JNIEnv* env,
+    const JavaParamRef<jbyteArray>& j_base_key,
+    jlong j_kid,
+    jlong j_ctr,
+    const JavaParamRef<jbyteArray>& j_frame,
+    jint j_prefix_len) {
+  if (j_base_key.is_null() || j_frame.is_null() || j_kid < 0 || j_ctr < 0 ||
+      j_prefix_len < 0) {
+    return nullptr;
+  }
+  std::vector<int8_t> base = JavaToNativeByteArray(env, j_base_key);
+  const std::vector<int8_t> frame = JavaToNativeByteArray(env, j_frame);
+  const std::vector<uint8_t> unit = SframeKeyStore::VectorSeal(
+      std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(base.data()),
+                               base.size()),
+      static_cast<uint64_t>(j_kid), static_cast<uint64_t>(j_ctr),
+      std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(frame.data()),
+                               frame.size()),
+      static_cast<size_t>(j_prefix_len));
+  std::fill(base.begin(), base.end(), 0);
+  if (unit.empty()) {
+    return nullptr;
+  }
+  std::vector<int8_t> out(unit.begin(), unit.end());
+  return NativeToJavaByteArray(env, std::span<int8_t>(out));
+}
+
+static ScopedJavaLocalRef<jbyteArray> JNI_SFrameKeyStore_VectorOpen(
+    JNIEnv* env,
+    const JavaParamRef<jbyteArray>& j_base_key,
+    jlong j_kid,
+    const JavaParamRef<jbyteArray>& j_unit,
+    jint j_prefix_len) {
+  if (j_base_key.is_null() || j_unit.is_null() || j_kid < 0 ||
+      j_prefix_len < 0) {
+    return nullptr;
+  }
+  std::vector<int8_t> base = JavaToNativeByteArray(env, j_base_key);
+  const std::vector<int8_t> unit = JavaToNativeByteArray(env, j_unit);
+  const std::optional<std::vector<uint8_t>> frame = SframeKeyStore::VectorOpen(
+      std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(base.data()),
+                               base.size()),
+      static_cast<uint64_t>(j_kid),
+      std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(unit.data()),
+                               unit.size()),
+      static_cast<size_t>(j_prefix_len));
+  std::fill(base.begin(), base.end(), 0);
+  if (!frame) {
+    return nullptr;
+  }
+  std::vector<int8_t> out(frame->begin(), frame->end());
+  return NativeToJavaByteArray(env, std::span<int8_t>(out));
+}
+
 // ---- SFrameCryptor
 // ----------------------------------------------------------------------------------------------
 

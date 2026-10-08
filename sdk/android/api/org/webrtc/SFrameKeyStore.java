@@ -104,6 +104,21 @@ public class SFrameKeyStore {
     return nativeGetStatsJson(nativeKeyStore);
   }
 
+  /**
+   * Vector check (no live key involved): seals ONE Opus/VP8-shaped unit with the transformer's own derivation and
+   * AEAD, under the key of {@code kid} derived from {@code baseKey}, with an explicit {@code ctr}. Null on error.
+   */
+  @Nullable
+  public static byte[] vectorSeal(byte[] baseKey, long kid, long ctr, byte[] frame, int prefixLen) {
+    return nativeVectorSeal(baseKey, kid, ctr, frame, prefixLen);
+  }
+
+  /** Vector check: opens ONE unit sealed under {@code kid}/{@code baseKey}. Null on any failure (bad tag, other KID). */
+  @Nullable
+  public static byte[] vectorOpen(byte[] baseKey, long kid, byte[] unit, int prefixLen) {
+    return nativeVectorOpen(baseKey, kid, unit, prefixLen);
+  }
+
   public void dispose() {
     checkExists();
     nativeSetObserver(nativeKeyStore, null);
@@ -128,4 +143,8 @@ public class SFrameKeyStore {
   private static native void nativeSetH264Enabled(long keyStore, boolean enabled);
   private static native void nativeSetObserver(long keyStore, @Nullable Observer observer);
   private static native String nativeGetStatsJson(long keyStore);
+  @Nullable
+  private static native byte[] nativeVectorSeal(byte[] baseKey, long kid, long ctr, byte[] frame, int prefixLen);
+  @Nullable
+  private static native byte[] nativeVectorOpen(byte[] baseKey, long kid, byte[] unit, int prefixLen);
 }

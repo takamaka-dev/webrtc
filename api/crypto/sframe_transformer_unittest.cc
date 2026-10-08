@@ -214,6 +214,26 @@ TEST(SframeTransformer, JavaVectorsByteForByteThroughTheTransformer) {
   EXPECT_EQ(rvideo->GetStats().dropped_total(), 0u);
 }
 
+TEST(SframeTransformer, VectorSealAndOpenSeamsReproduceTheJavaUnits) {
+  for (const UnitCase& c : kUnitCases) {
+    const std::vector<uint8_t> unit = SframeKeyStore::VectorSeal(
+        kBase, kUnitsKid, c.ctr, Unhex(c.frame), c.prefix_len);
+    EXPECT_EQ(Hex(unit), c.unit);
+    std::optional<std::vector<uint8_t>> frame = SframeKeyStore::VectorOpen(
+        kBase, kUnitsKid, Unhex(c.unit), c.prefix_len);
+    ASSERT_TRUE(frame);
+    EXPECT_EQ(Hex(*frame), c.frame);
+  }
+  std::vector<uint8_t> t = Unhex(kUnitCases[0].unit);
+  t.back() ^= 1;
+  EXPECT_FALSE(SframeKeyStore::VectorOpen(kBase, kUnitsKid, t, 1));
+  EXPECT_FALSE(SframeKeyStore::VectorOpen(OtherBase(), kUnitsKid,
+                                          Unhex(kUnitCases[0].unit), 1));
+  EXPECT_FALSE(SframeKeyStore::VectorOpen(kBase, kUnitsKid + 1,
+                                          Unhex(kUnitCases[0].unit), 1));
+  EXPECT_TRUE(SframeKeyStore::VectorSeal(kBase, kUnitsKid, 0, {}, 1).empty());
+}
+
 // ---- CM-2: nothing passes in plaintext while a key is missing
 // ---------------------------------------------------
 

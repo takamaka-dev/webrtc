@@ -331,6 +331,58 @@ void SframeKeyStore::SetH264Enabled(bool enabled) {
   h264_enabled_ = enabled;
 }
 
+std::vector<uint8_t> SframeKeyStore::VectorSeal(
+    std::span<const uint8_t> base_key,
+    uint64_t kid,
+    uint64_t ctr,
+    std::span<const uint8_t> frame,
+    size_t prefix_len) {
+  sframe::KeyMaterial material;
+  if (prefix_len > frame.size() || base_key.empty() ||
+      !sframe::DeriveKeyMaterial(kid, base_key, &material)) {
+    return {};
+  }
+  std::unique_ptr<sframe::SealingKey> key =
+      sframe::SealingKey::Create(kid, material);
+  if (!key) {
+    return {};
+  }
+  const std::span<const uint8_t> prefix = frame.first(prefix_len);
+  const std::vector<uint8_t> header = sframe::EncodeHeader(kid, ctr);
+  std::vector<uint8_t> out(prefix.begin(), prefix.end());
+  out.insert(out.end(), header.begin(), header.end());
+  if (!key->Seal(ctr, header, prefix, frame.subspan(prefix_len), &out)) {
+    return {};
+  }
+  return out;
+}
+
+std::optional<std::vector<uint8_t>> SframeKeyStore::VectorOpen(
+    std::span<const uint8_t> base_key,
+    uint64_t kid,
+    std::span<const uint8_t> unit,
+    size_t prefix_len) {
+  sframe::KeyMaterial material;
+  if (prefix_len >= unit.size() || base_key.empty() ||
+      !sframe::DeriveKeyMaterial(kid, base_key, &material)) {
+    return std::nullopt;
+  }
+  std::unique_ptr<sframe::SealingKey> key =
+      sframe::SealingKey::Create(kid, material);
+  const std::optional<sframe::Header> h =
+      sframe::ParseHeader(unit.subspan(prefix_len));
+  if (!key || !h || h->kid != kid) {
+    return std::nullopt;
+  }
+  const std::span<const uint8_t> prefix = unit.first(prefix_len);
+  std::vector<uint8_t> out(prefix.begin(), prefix.end());
+  if (!key->Open(h->ctr, unit.subspan(prefix_len, h->length), prefix,
+                 unit.subspan(prefix_len + h->length), &out)) {
+    return std::nullopt;
+  }
+  return out;
+}
+
 std::vector<SframeStreamStats> SframeKeyStore::GetAllStats() const {
   MutexLock lock(&mutex_);
   std::vector<SframeStreamStats> out;

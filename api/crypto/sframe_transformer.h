@@ -58,9 +58,9 @@ enum class SframeMediaKind { kAudio, kVideo };
 // worker's.
 enum class SframeDropReason {
   kEmpty = 0,  // zero-length frame (sender: no Opus TOC; spec §9.1 [0.2])
-  kCodec,  // not Opus (audio) / not VP8 (video) / H.264 not enabled — never
-           // sent or played
-  kNoKey,  // sender: no send KID or no key for it
+  kCodec,      // not Opus (audio) / not VP8 (video) / H.264 not enabled — never
+               // sent or played
+  kNoKey,      // sender: no send KID or no key for it
   kCtrExhausted,  // sender: CTR reached kCtrLimit — needs a new epoch
   kShort,         // receiver: shorter than prefix + 1 + tag
   kBadHeader,     // receiver: truncated / non-minimal SFrame header
@@ -189,6 +189,25 @@ class RTC_EXPORT SframeKeyStore : public RefCountInterface {
   // fallback layout). Default OFF: H.264 is dropped like any other codec until
   // the layout is fixed by test (a) on the fork (OPEN H-1 of the M1 report).
   void SetH264Enabled(bool enabled);
+
+  // Vector checks for the platform bindings (JNI / Flutter platform channel):
+  // seal / open ONE Opus- or VP8-shaped unit (clear prefix of `prefix_len`
+  // bytes) with the same derivation and AEAD code the transformer uses, under
+  // a key derived from `base_key` for `kid` and an explicit `ctr`. Static on
+  // purpose: they never touch a store's live keys, CTR counters or replay
+  // windows, so they cannot reuse a live (key, nonce) pair. Empty / nullopt on
+  // any error (bad base key, prefix longer than the input, bad header, other
+  // KID, bad tag).
+  static std::vector<uint8_t> VectorSeal(std::span<const uint8_t> base_key,
+                                         uint64_t kid,
+                                         uint64_t ctr,
+                                         std::span<const uint8_t> frame,
+                                         size_t prefix_len);
+  static std::optional<std::vector<uint8_t>> VectorOpen(
+      std::span<const uint8_t> base_key,
+      uint64_t kid,
+      std::span<const uint8_t> unit,
+      size_t prefix_len);
 
  protected:
   explicit SframeKeyStore(Clock* clock);
