@@ -95,6 +95,11 @@ std::string StatsJson(const SframeStreamStats& s) {
          "\":" + std::to_string(s.dropped[i]);
   }
   j += "}";
+  j += ",\"dropSamples\":[";
+  for (size_t i = 0; i < s.drop_samples.size(); ++i) {
+    j += (i ? "," : "") + JsonString(s.drop_samples[i]);
+  }
+  j += "]";
   j += ",\"consecutive\":" + std::to_string(s.consecutive);
   j += ",\"storm\":" + std::string(s.storm ? "true" : "false");
   j += ",\"storms\":" + std::to_string(s.storms);

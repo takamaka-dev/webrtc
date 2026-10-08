@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <string_view>
 #include <utility>
 
 #include "api/make_ref_counted.h"
@@ -469,6 +470,35 @@ SframeKeyStore::KeyEntry* SframeKeyStore::FindKeyLocked(uint64_t kid) {
   return it == keys_.end() ? nullptr : &it->second;
 }
 
+void SframeKeyStore::SampleDrop(Stream* stream,
+                                SframeDropReason why,
+                                std::span<const uint8_t> data) {
+  // Receive side only, as the web worker: a sender's dropped frame is
+  // PLAINTEXT media, which must never reach stats or logs.
+  if (stream->stats.role != SframeRole::kReceiver) {
+    return;
+  }
+  std::vector<std::string>& samples = stream->stats.drop_samples;
+  const std::string name = SframeDropReasonName(why);
+  size_t same = 0;
+  for (const std::string& s : samples) {
+    if (s.compare(0, name.size() + 1, name + " ") == 0) {
+      ++same;
+    }
+  }
+  if (same >= 3 || samples.size() >= 12) {
+    return;
+  }
+  static constexpr std::string_view kHex = "0123456789abcdef";
+  std::string hex;
+  for (uint8_t b : data.first(std::min<size_t>(12, data.size()))) {
+    hex += kHex[b >> 4];
+    hex += kHex[b & 15];
+  }
+  samples.push_back(name + " len=" + std::to_string(data.size()) +
+                    " first=" + hex);
+}
+
 void SframeKeyStore::DropLocked(Stream* stream,
                                 SframeDropReason why,
                                 Events* events) {
@@ -536,6 +566,7 @@ bool SframeKeyStore::Process(Stream* stream,
           : TransformableFrameInterface::Direction::kReceiver;
   if (frame.GetDirection() != expected) {
     DropLocked(stream, SframeDropReason::kInternal, events);
+    SampleDrop(stream, SframeDropReason::kInternal, data);
     return false;
   }
   SframeDropReason why = SframeDropReason::kInternal;
@@ -546,6 +577,7 @@ bool SframeKeyStore::Process(Stream* stream,
   if (!ok) {
     out->clear();
     DropLocked(stream, why, events);
+    SampleDrop(stream, why, data);
     return false;
   }
   st.passed++;
@@ -706,6 +738,14 @@ bool SframeKeyStore::OpenLocked(Stream* stream,
                                 SframeDropReason* why,
                                 uint64_t* kid_out) {
   const std::span<const uint8_t> data = frame.GetData();
+  if (data.empty()) {
+    // Padding-only RTP packets (bandwidth probing) reach the audio receive
+    // transform as zero-length frames (audio/channel_receive.cc subtracts the
+    // padding). No media, not a decryption failure: dropped as 'empty', not
+    // counted toward the storm (M2 finding F-M2-1).
+    *why = SframeDropReason::kEmpty;
+    return false;
+  }
   if (data.size() < kPrefix + 1 + sframe::kTagSize) {
     *why = SframeDropReason::kShort;
     return false;

@@ -252,6 +252,8 @@ TEST(SframeTransformer, SenderWithoutSendKidDropsEverything) {
   EXPECT_TRUE(alice.sinks["a"]->frames.empty());
   EXPECT_TRUE(alice.sinks["v"]->frames.empty());
   EXPECT_EQ(Dropped(audio->GetStats(), SframeDropReason::kNoKey), 3u);
+  // A sender's dropped frames are plaintext: never sampled into the stats.
+  EXPECT_TRUE(audio->GetStats().drop_samples.empty());
   EXPECT_EQ(Dropped(video->GetStats(), SframeDropReason::kNoKey), 1u);
   // Removing the send key closes the sender again.
   ASSERT_TRUE(alice.store->SetSendKid(kUnitsKid));
@@ -303,6 +305,8 @@ TEST(SframeTransformer, ReceiverFailsClosed) {
 
   rv->Transform(VideoFrame(unit, Direction::kReceiver));  // no key at all
   EXPECT_EQ(Dropped(rv->GetStats(), SframeDropReason::kUnknownKid), 1u);
+  ASSERT_EQ(rv->GetStats().drop_samples.size(), 1u);
+  EXPECT_EQ(rv->GetStats().drop_samples[0].rfind("unknown-kid len=", 0), 0u);
   ASSERT_EQ(bob.store->SetKey(kUnitsKid, OtherBase()),
             SframeKeyStore::SetKeyResult::kChanged);
   rv->Transform(VideoFrame(unit, Direction::kReceiver));  // same KID, wrong key
@@ -353,7 +357,10 @@ TEST(SframeTransformer, ReceiverFailsClosed) {
   rv->Transform(
       VideoFrame({0x10, 0xa0, 0x01, 0x00, 0x04}, Direction::kReceiver));
   rv->Transform(VideoFrame({}, Direction::kReceiver));
-  EXPECT_EQ(Dropped(rv->GetStats(), SframeDropReason::kShort), 2u);
+  EXPECT_EQ(Dropped(rv->GetStats(), SframeDropReason::kShort), 1u);
+  // zero-length on receive = padding-only RTP (F-M2-1): 'empty', not a storm
+  // reason
+  EXPECT_EQ(Dropped(rv->GetStats(), SframeDropReason::kEmpty), 1u);
   // A codec that is not VP8 on a video receiver is never played.
   rv->Transform(
       VideoFrame(Unhex(kUnitCases[3].unit), Direction::kReceiver, "video/VP9"));

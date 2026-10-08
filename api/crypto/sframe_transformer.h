@@ -98,6 +98,11 @@ struct RTC_EXPORT SframeStreamStats {
   std::optional<Timestamp> first_frame_at;
   std::optional<Timestamp> first_pass_at;
   std::optional<Timestamp> last_frame_at;
+  // Receive side only. Diagnostics, as the web worker's dropSamples: the first
+  // drops of each reason as "reason len=N first=<hex of the first 12 bytes>"
+  // (at most 3 per reason, 12 in all). Clear prefix / header / ciphertext only,
+  // never a key.
+  std::vector<std::string> drop_samples;
   uint64_t dropped_total() const;
 };
 
@@ -246,6 +251,9 @@ class RTC_EXPORT SframeKeyStore : public RefCountInterface {
   void DropLocked(Stream* stream, SframeDropReason why, Events* events)
       RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
   void RecordNoSink(Stream* stream, size_t bytes, Events* events);
+  static void SampleDrop(Stream* stream,
+                         SframeDropReason why,
+                         std::span<const uint8_t> data);
   void PurgeExpiredLocked(Events* events) RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
   KeyEntry* FindKeyLocked(uint64_t kid) RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
   void Dispatch(const Events& events);
