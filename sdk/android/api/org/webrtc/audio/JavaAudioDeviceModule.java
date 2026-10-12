@@ -384,6 +384,15 @@ public class JavaAudioDeviceModule implements AudioDeviceModule {
    * Returns true if the device supports built-in HW AEC, and the UUID is approved (some UUIDs can
    * be excluded).
    */
+  /**
+   * Takamaka C-25 (2026-10-12): when true, every AudioRecord this module creates on API 29+ gets
+   * setPreferredMicrophoneDirection(MIC_DIRECTION_TOWARDS_USER) right after creation (a hint the OEM may ignore;
+   * the return value is logged). Off by default; set it before the first audio track exists.
+   */
+  public static void setPreferMicrophoneTowardsUser(boolean enable) {
+    WebRtcAudioRecord.setPreferMicrophoneTowardsUser(enable);
+  }
+
   public static boolean isBuiltInAcousticEchoCancelerSupported() {
     return WebRtcAudioEffects.isAcousticEchoCancelerSupported();
   }
