@@ -377,6 +377,12 @@ AudioProcessingApplyResult ApplyAudioProcessingOptions(AudioProcessing *apm, Aud
     apm_config.gain_controller1.mode = AudioProcessing::Config::GainController1::kAdaptiveAnalog;
 #endif
   }
+  // Takamaka C-25 (2026-10-12): exactly ONE AGC stage. When the app enabled AGC2
+  // (ExternalAudioProcessingFactory.setAdaptiveDigitalAgc), the per-track
+  // auto_gain_control option must not re-enable AGC1 on top of it.
+  if (apm_config.gain_controller2.enabled) {
+    apm_config.gain_controller1.enabled = false;
+  }
 
   if (software_options.highpass_filter.has_value()) {
     apm_config.high_pass_filter.enabled = *software_options.highpass_filter;

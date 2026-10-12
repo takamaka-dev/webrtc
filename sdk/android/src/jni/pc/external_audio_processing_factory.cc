@@ -22,6 +22,7 @@
 #include "api/audio/builtin_audio_processing_builder.h"
 #include "api/environment/environment_factory.h"
 #include "api/make_ref_counted.h"
+#include "rtc_base/logging.h"
 #include "rtc_base/ref_counted_object.h"
 #include "sdk/android/generated_peerconnection_jni/ExternalAudioProcessingFactory_jni.h"
 #include "sdk/android/native_api/jni/java_types.h"
@@ -128,6 +129,42 @@ static void JNI_ExternalAudioProcessingFactory_SetBypassFlagForRenderPre(
     return;
   }
   default_processor_ptr->render_pre_processor()->SetBypassFlag(bypass);
+}
+
+// Takamaka C-25 (2026-10-12): WebRTC's adaptive digital AGC (AGC2: adaptive
+// digital controller + limiter, no input-volume controller — Android exposes
+// no microphone gain) as the ONE AGC stage; AGC1 off while it is on (the
+// per-track option is clamped in media/engine/audio_processing_controller.cc).
+static void JNI_ExternalAudioProcessingFactory_SetAdaptiveDigitalAgc(
+    JNIEnv* env,
+    jboolean j_enabled) {
+  if (!default_processor_ptr) {
+    return;
+  }
+  const bool enabled = j_enabled;
+  webrtc::AudioProcessing::Config c = default_processor_ptr->apm()->GetConfig();
+  c.gain_controller2.enabled = enabled;
+  c.gain_controller2.adaptive_digital.enabled = enabled;
+  c.gain_controller2.input_volume_controller.enabled = false;
+  c.gain_controller2.fixed_digital.gain_db = 0.0f;
+  if (enabled) {
+    c.gain_controller1.enabled = false;
+  }
+  default_processor_ptr->apm()->ApplyConfig(c);
+  RTC_LOG(LS_INFO) << "tkm C-25: AGC2 adaptive digital "
+                   << (enabled ? "ON" : "OFF")
+                   << " (AGC1 " << (c.gain_controller1.enabled ? "on" : "off")
+                   << ", hpf " << (c.high_pass_filter.enabled ? "on" : "off")
+                   << ")";
+}
+
+static ScopedJavaLocalRef<jstring>
+JNI_ExternalAudioProcessingFactory_GetAudioProcessingConfig(JNIEnv* env) {
+  if (!default_processor_ptr) {
+    return NativeToJavaString(env, "");
+  }
+  return NativeToJavaString(env,
+                            default_processor_ptr->apm()->GetConfig().ToString());
 }
 
 static void JNI_ExternalAudioProcessingFactory_Destroy(JNIEnv* env) {

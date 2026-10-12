@@ -19,6 +19,7 @@ import android.media.AudioRecord;
 import android.media.AudioRecordingConfiguration;
 import android.media.AudioTimestamp;
 import android.media.MediaRecorder.AudioSource;
+import android.media.MicrophoneDirection;
 import android.os.Build;
 import android.os.Process;
 import androidx.annotation.Nullable;
@@ -65,6 +66,17 @@ class WebRtcAudioRecord {
   private static final long AUDIO_RECORD_THREAD_JOIN_TIMEOUT_MS = 2000;
 
   public static final int DEFAULT_AUDIO_SOURCE = AudioSource.VOICE_COMMUNICATION;
+
+  /**
+   * Takamaka C-25 (2026-10-12): when true, every AudioRecord this module creates on API 29+ gets
+   * setPreferredMicrophoneDirection(MIC_DIRECTION_TOWARDS_USER) right after creation (a hint the OEM may ignore;
+   * the return value is logged). Off by default; the app turns it on before the first track.
+   */
+  private static volatile boolean preferMicrophoneTowardsUser = false;
+
+  public static void setPreferMicrophoneTowardsUser(boolean enable) {
+    preferMicrophoneTowardsUser = enable;
+  }
 
   // Default audio data format is PCM 16 bit per sample.
   // Guaranteed to be supported by all devices.
@@ -653,6 +665,15 @@ class WebRtcAudioRecord {
       }
 
       effects.enable(audioRecord.getAudioSessionId());
+
+      if (preferMicrophoneTowardsUser && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        try {
+          boolean ok = audioRecord.setPreferredMicrophoneDirection(MicrophoneDirection.MIC_DIRECTION_TOWARDS_USER);
+          Logging.d(TAG, "tkm C-25: setPreferredMicrophoneDirection(TOWARDS_USER) = " + ok);
+        } catch (RuntimeException e) {
+          Logging.w(TAG, "tkm C-25: setPreferredMicrophoneDirection failed: " + e.getMessage());
+        }
+      }
 
       logMainParameters();
       logMainParametersExtended();

@@ -135,7 +135,25 @@ public class ExternalAudioProcessingFactory implements AudioProcessingFactory {
     }
   }
 
+  /**
+   * Takamaka C-25 (2026-10-12): WebRTC's adaptive digital AGC (AGC2 adaptive digital controller + limiter) on the
+   * capture path, as the ONE software AGC stage — AGC1 stays off while it is on, whatever the track's
+   * autoGainControl option says. Android exposes no microphone gain, so the analog controller is never used.
+   */
+  public void setAdaptiveDigitalAgc(boolean enabled) {
+    checkExternalAudioProcessorExists();
+    nativeSetAdaptiveDigitalAgc(enabled);
+  }
+
+  /** The live AudioProcessing::Config as WebRTC prints it (for logs and device proofs). */
+  public String getAudioProcessingConfig() {
+    checkExternalAudioProcessorExists();
+    return nativeGetAudioProcessingConfig();
+  }
+
   private static native long nativeGetDefaultApm();
+  private static native void nativeSetAdaptiveDigitalAgc(boolean enabled);
+  private static native String nativeGetAudioProcessingConfig();
   private static native long nativeSetCapturePostProcessing(AudioProcessing processing);
   private static native long nativeSetRenderPreProcessing(AudioProcessing processing);
   private static native void nativeSetBypassFlagForCapturePost(boolean bypass);
