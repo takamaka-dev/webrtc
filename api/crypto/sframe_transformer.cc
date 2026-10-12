@@ -6,6 +6,7 @@
 #include "api/crypto/sframe_transformer.h"
 
 #include <algorithm>
+#include <deque>
 #include <cctype>
 #include <string_view>
 #include <utility>
@@ -116,6 +117,10 @@ const char* SframeDropReasonName(SframeDropReason reason) {
       return "no-sink";
     case SframeDropReason::kInternal:
       return "internal";
+    case SframeDropReason::kHeldExpired:
+      return "held-expired";
+    case SframeDropReason::kHeldOverflow:
+      return "held-overflow";
     case SframeDropReason::kCount:
       break;
   }
@@ -125,11 +130,15 @@ const char* SframeDropReasonName(SframeDropReason reason) {
 bool SframeDropCountsForStorm(SframeDropReason reason) {
   // The web worker's COUNTS_FOR_STORM ('bad-tag', 'unknown-kid', 'bad-header',
   // 'short') + H.264 'malformed'.
+  // C-24: a held frame whose key never came (or that overflowed the hold) is
+  // an unknown-kid drop that waited.
   return reason == SframeDropReason::kBadTag ||
          reason == SframeDropReason::kUnknownKid ||
          reason == SframeDropReason::kBadHeader ||
          reason == SframeDropReason::kShort ||
-         reason == SframeDropReason::kMalformed;
+         reason == SframeDropReason::kMalformed ||
+         reason == SframeDropReason::kHeldExpired ||
+         reason == SframeDropReason::kHeldOverflow;
 }
 
 const char* SframeEventTypeName(SframeEvent::Type type) {
@@ -150,6 +159,10 @@ const char* SframeEventTypeName(SframeEvent::Type type) {
       return "key-expired";
     case SframeEvent::Type::kKeyEvicted:
       return "key-evicted";
+    case SframeEvent::Type::kHeld:
+      return "held";
+    case SframeEvent::Type::kReleased:
+      return "released";
   }
   return "?";
 }
@@ -186,6 +199,7 @@ SframeKeyStore::SetKeyResult SframeKeyStore::SetKey(
     return SetKeyResult::kInvalid;
   }
   Events events;
+  std::vector<Delivery> deliveries;
   SetKeyResult result;
   {
     MutexLock lock(&mutex_);
@@ -247,9 +261,12 @@ SframeKeyStore::SetKeyResult SframeKeyStore::SetKey(
         s->stats.storm = false;
         s->stats.consecutive = 0;
       }
+      // C-24: the frames held for this KID open now, in order
+      ReleaseHeldLocked(kid, &events, &deliveries);
     }
   }
   Dispatch(events);
+  Deliver(std::move(deliveries));
   return result;
 }
 
@@ -320,6 +337,24 @@ void SframeKeyStore::SetStormThreshold(int n) {
   }
   MutexLock lock(&mutex_);
   storm_threshold_ = n;
+}
+
+void SframeKeyStore::SetHoldTime(TimeDelta hold) {
+  Events events;
+  {
+    MutexLock lock(&mutex_);
+    hold_time_ = std::max(hold, TimeDelta::Zero());
+    if (hold_time_.IsZero()) {
+      // nothing may wait any more: what is held drops now
+      for (auto& s : streams_) {
+        for (HeldFrame& h : s->held) {
+          h.deadline = Timestamp::MinusInfinity();
+        }
+      }
+      ExpireHeldLocked(&events);
+    }
+  }
+  Dispatch(events);
 }
 
 void SframeKeyStore::SetObserver(scoped_refptr<SframeObserver> observer) {
@@ -396,11 +431,13 @@ std::vector<SframeStreamStats> SframeKeyStore::GetAllStats() const {
 SframeKeyStore::Stream* SframeKeyStore::RegisterStream(
     const std::string& stream_id,
     SframeRole role,
-    SframeMediaKind kind) {
+    SframeMediaKind kind,
+    SframeTransformer* transformer) {
   auto s = std::make_unique<Stream>();
   s->stats.stream_id = stream_id;
   s->stats.role = role;
   s->stats.kind = kind;
+  s->transformer = transformer;
   Stream* raw = s.get();
   MutexLock lock(&mutex_);
   streams_.push_back(std::move(s));
@@ -439,6 +476,7 @@ void SframeKeyStore::Dispatch(const Events& events) {
 }
 
 void SframeKeyStore::PurgeExpiredLocked(Events* events) {
+  ExpireHeldLocked(events);
   const Timestamp now = clock_->CurrentTime();
   for (auto it = keys_.begin(); it != keys_.end();) {
     if (it->second.expires_at && *it->second.expires_at <= now) {
@@ -535,9 +573,12 @@ void SframeKeyStore::DropLocked(Stream* stream,
 }
 
 bool SframeKeyStore::Process(Stream* stream,
-                             const TransformableFrameInterface& frame,
+                             std::unique_ptr<TransformableFrameInterface>& frame_ptr,
                              std::vector<uint8_t>* out,
-                             Events* events) {
+                             Events* events,
+                             bool* held) {
+  *held = false;
+  const TransformableFrameInterface& frame = *frame_ptr;
   MutexLock lock(&mutex_);
   PurgeExpiredLocked(events);
   SframeStreamStats& st = stream->stats;
@@ -576,12 +617,30 @@ bool SframeKeyStore::Process(Stream* stream,
                       : OpenLocked(stream, frame, out, &why, &kid);
   if (!ok) {
     out->clear();
+    if (why == SframeDropReason::kUnknownKid && st.last_kid &&
+        ShouldHoldLocked(stream, *st.last_kid)) {
+      // C-24: the key of a known leg's next epoch has not arrived yet — wait
+      // for it instead of breaking the decoder's reference chain
+      HoldLocked(stream, std::move(frame_ptr), *st.last_kid, events);
+      *held = true;
+      return false;
+    }
     DropLocked(stream, why, events);
     SampleDrop(stream, why, data);
     return false;
   }
+  PassLocked(stream, kid, out->size(), events);
+  return true;
+}
+
+void SframeKeyStore::PassLocked(Stream* stream,
+                                uint64_t kid,
+                                size_t out_bytes,
+                                Events* events) {
+  SframeStreamStats& st = stream->stats;
+  const Timestamp now = clock_->CurrentTime();
   st.passed++;
-  st.bytes_out += out->size();
+  st.bytes_out += out_bytes;
   stream->last_reported_drop.reset();
   if (!st.first_pass_at) {
     st.first_pass_at = now;
@@ -615,7 +674,141 @@ bool SframeKeyStore::Process(Stream* stream,
       }
     }
   }
-  return true;
+}
+
+// ---- C-24 hold
+// ----------------------------------------------------------------------------------------------------
+
+bool SframeKeyStore::ShouldHoldLocked(const Stream* stream,
+                                      uint64_t kid) const {
+  if (hold_time_.IsZero() || stream->stats.role != SframeRole::kReceiver ||
+      stream->stats.kind != SframeMediaKind::kVideo ||
+      !sframe::IsAssignableKid(kid)) {
+    return false;
+  }
+  const uint32_t leg = sframe::LegIndexOf(kid);
+  for (const auto& [k, e] : keys_) {
+    if (sframe::LegIndexOf(k) != leg) {
+      continue;
+    }
+    const uint32_t ahead =
+        (sframe::EpochOf(kid) - sframe::EpochOf(k)) & 0xFFFF;
+    if (ahead >= 1 && ahead <= kHoldEpochsAhead) {
+      return true;  // a known leg, an epoch this receiver has not reached
+    }
+  }
+  return false;
+}
+
+void SframeKeyStore::HoldLocked(Stream* stream,
+                                std::unique_ptr<TransformableFrameInterface> frame,
+                                uint64_t kid,
+                                Events* events) {
+  SframeStreamStats& st = stream->stats;
+  const size_t bytes = frame->GetData().size();
+  while (!stream->held.empty() &&
+         (stream->held.size() >= kMaxHeldFrames ||
+          stream->held_bytes + bytes > kMaxHeldBytes)) {
+    HeldFrame& old = stream->held.front();
+    stream->held_bytes -= old.bytes;
+    st.held_now--;
+    DropLocked(stream, SframeDropReason::kHeldOverflow, events);
+    SampleDrop(stream, SframeDropReason::kHeldOverflow, old.frame->GetData());
+    stream->held.pop_front();
+  }
+  const bool first = stream->held.empty();
+  HeldFrame h;
+  h.frame = std::move(frame);
+  h.kid = kid;
+  h.deadline = clock_->CurrentTime() + hold_time_;
+  h.bytes = bytes;
+  stream->held.push_back(std::move(h));
+  stream->held_bytes += bytes;
+  st.held++;
+  st.held_now++;
+  if (first) {
+    SframeEvent e;
+    e.type = SframeEvent::Type::kHeld;
+    e.stream_id = st.stream_id;
+    e.role = st.role;
+    e.kind = st.kind;
+    e.kid = kid;
+    events->push_back(e);
+  }
+}
+
+void SframeKeyStore::ReleaseHeldLocked(uint64_t kid,
+                                       Events* events,
+                                       std::vector<Delivery>* deliveries) {
+  for (auto& s : streams_) {
+    if (s->held.empty()) {
+      continue;
+    }
+    std::deque<HeldFrame> keep;
+    uint64_t released = 0;
+    for (HeldFrame& h : s->held) {
+      if (h.kid != kid) {
+        keep.push_back(std::move(h));
+        continue;
+      }
+      s->held_bytes -= h.bytes;
+      s->stats.held_now--;
+      std::vector<uint8_t> out;
+      SframeDropReason why = SframeDropReason::kInternal;
+      uint64_t opened_kid = 0;
+      const bool ok = OpenLocked(s.get(), *h.frame, &out, &why, &opened_kid);
+      if (!ok) {
+        DropLocked(s.get(), why, events);
+        SampleDrop(s.get(), why, h.frame->GetData());
+        continue;
+      }
+      scoped_refptr<TransformedFrameCallback> sink =
+          s->transformer ? s->transformer->SinkFor(h.frame->GetSsrc())
+                         : nullptr;
+      if (!sink) {
+        DropLocked(s.get(), SframeDropReason::kNoSink, events);
+        continue;
+      }
+      h.frame->SetData(out);
+      PassLocked(s.get(), opened_kid, out.size(), events);
+      s->stats.held_released++;
+      released++;
+      deliveries->push_back(Delivery{std::move(sink), std::move(h.frame)});
+    }
+    s->held = std::move(keep);
+    if (released > 0) {
+      SframeEvent e;
+      e.type = SframeEvent::Type::kReleased;
+      e.stream_id = s->stats.stream_id;
+      e.role = s->stats.role;
+      e.kind = s->stats.kind;
+      e.kid = kid;
+      e.count = released;
+      events->push_back(e);
+    }
+  }
+}
+
+void SframeKeyStore::ExpireHeldLocked(Events* events) {
+  const Timestamp now = clock_->CurrentTime();
+  for (auto& s : streams_) {
+    // deadlines are in insertion order (one hold time per store)
+    while (!s->held.empty() && s->held.front().deadline <= now) {
+      HeldFrame& h = s->held.front();
+      s->held_bytes -= h.bytes;
+      s->stats.held_now--;
+      DropLocked(s.get(), SframeDropReason::kHeldExpired, events);
+      SampleDrop(s.get(), SframeDropReason::kHeldExpired,
+                 h.frame->GetData());
+      s->held.pop_front();
+    }
+  }
+}
+
+void SframeKeyStore::Deliver(std::vector<Delivery> deliveries) {
+  for (Delivery& d : deliveries) {
+    d.sink->OnTransformedFrame(std::move(d.frame));
+  }
 }
 
 bool SframeKeyStore::SealLocked(Stream* stream,
@@ -909,7 +1102,7 @@ SframeTransformer::SframeTransformer(scoped_refptr<SframeKeyStore> store,
     : store_(std::move(store)),
       role_(role),
       kind_(kind),
-      stream_(store_->RegisterStream(stream_id, role, kind)) {}
+      stream_(store_->RegisterStream(stream_id, role, kind, this)) {}
 
 SframeTransformer::~SframeTransformer() {
   store_->UnregisterStream(stream_);
@@ -938,12 +1131,17 @@ void SframeTransformer::Transform(
   SframeKeyStore::Events events;
   std::vector<uint8_t> out;
   bool ok = false;
+  bool held = false;
   if (!sink) {
     store_->RecordNoSink(stream_, frame->GetData().size(), &events);
   } else {
-    ok = store_->Process(stream_, *frame, &out, &events);
+    ok = store_->Process(stream_, frame, &out, &events, &held);
   }
   store_->Dispatch(events);
+  if (held) {
+    return;  // C-24: the store owns the frame until its key arrives (SetKey
+             // delivers it) or the hold expires
+  }
   if (!ok) {
     return;  // dropped: neither plaintext nor ciphertext goes further
   }

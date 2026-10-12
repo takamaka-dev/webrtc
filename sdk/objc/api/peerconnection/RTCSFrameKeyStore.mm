@@ -43,7 +43,8 @@ class RTCSFrameObserverAdapter : public SframeObserver {
                     streamId:[NSString stringForStdString:e.stream_id]
                       reason:[NSString stringWithUTF8String:reason]
                          kid:e.kid ? static_cast<int64_t>(*e.kid) : -1
-                 consecutive:static_cast<int64_t>(e.consecutive)];
+                 consecutive:static_cast<int64_t>(e.consecutive)
+                       count:static_cast<int64_t>(e.count)];
   }
 
  private:
@@ -110,6 +111,9 @@ std::string RTCSFrameStatsJson(const SframeStreamStats& s) {
   j += ",\"consecutive\":" + std::to_string(s.consecutive);
   j += ",\"storm\":" + std::string(s.storm ? "true" : "false");
   j += ",\"storms\":" + std::to_string(s.storms);
+  j += ",\"held\":" + std::to_string(s.held);
+  j += ",\"heldReleased\":" + std::to_string(s.held_released);
+  j += ",\"heldNow\":" + std::to_string(s.held_now);
   j += ",\"lastKid\":" + (s.last_kid ? std::to_string(*s.last_kid) : std::string("null"));
   j += ",\"firstFrameAtMs\":" + OptionalMs(s.first_frame_at);
   j += ",\"firstPassAtMs\":" + OptionalMs(s.first_pass_at);
@@ -188,6 +192,10 @@ std::string RTCSFrameStatsJson(const SframeStreamStats& s) {
 
 - (void)setStormThreshold:(int)threshold {
   _nativeKeyStore->SetStormThreshold(threshold);
+}
+
+- (void)setHoldTimeMs:(int64_t)holdMs {
+  _nativeKeyStore->SetHoldTime(webrtc::TimeDelta::Millis(holdMs < 0 ? 0 : holdMs));
 }
 
 - (void)setH264Enabled:(BOOL)enabled {

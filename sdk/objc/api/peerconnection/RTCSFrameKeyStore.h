@@ -38,8 +38,9 @@ typedef NS_ENUM(NSInteger, RTCSFrameMediaKind) {
 
 /**
  * Transformer events (engaged, first-pass, dropping, storm, recovered, resumed,
- * key-expired, key-evicted). Called on a WebRTC media thread with no lock held:
- * return quickly, hand the event to your own queue.
+ * key-expired, key-evicted, held, released). Called on a WebRTC media thread
+ * with no lock held: return quickly, hand the event to your own queue. `count`
+ * = the frames released (type `released`), else 0.
  */
 RTC_OBJC_EXPORT
 @protocol RTC_OBJC_TYPE(RTCSFrameKeyStoreDelegate)<NSObject>
@@ -48,7 +49,8 @@ RTC_OBJC_EXPORT
               streamId:(NSString *)streamId
                 reason:(NSString *)reason
                    kid:(int64_t)kid
-           consecutive:(int64_t)consecutive;
+           consecutive:(int64_t)consecutive
+                 count:(int64_t)count;
 @end
 
 /** The keys of one call; shared by every RTCSFrameCryptor of that call. */
@@ -76,6 +78,12 @@ RTC_OBJC_EXPORT
 - (int64_t)sendKid;
 
 - (void)setStormThreshold:(int)threshold;
+
+/**
+ * C-24 (spec §9.2 [0.3]): how long a receive VIDEO stream holds frames of a known leg's next epoch(s) while their
+ * key is missing (default 10 s = the retention default); 0 turns holding off (such frames drop as unknown-kid).
+ */
+- (void)setHoldTimeMs:(int64_t)holdMs;
 
 /** H.264 units (spec §9.2 fallback layout). Off by default: H.264 frames are dropped. */
 - (void)setH264Enabled:(BOOL)enabled;

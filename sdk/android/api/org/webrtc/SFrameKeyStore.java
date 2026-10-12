@@ -24,12 +24,13 @@ public class SFrameKeyStore {
   }
 
   /**
-   * Transformer events (storm, recovered, resumed, dropping, engaged, first-pass, key-expired, key-evicted). Called
-   * on a WebRTC media thread: return quickly, hand the event to your own thread.
+   * Transformer events (storm, recovered, resumed, dropping, engaged, first-pass, key-expired, key-evicted, held,
+   * released). Called on a WebRTC media thread: return quickly, hand the event to your own thread. {@code count} =
+   * the frames released (type {@code released}), else 0.
    */
   public interface Observer {
     @CalledByNative("Observer")
-    void onSFrameEvent(String type, String streamId, String reason, long kid, long consecutive);
+    void onSFrameEvent(String type, String streamId, String reason, long kid, long consecutive, long count);
   }
 
   private long nativeKeyStore;
@@ -93,6 +94,15 @@ public class SFrameKeyStore {
     nativeSetH264Enabled(nativeKeyStore, enabled);
   }
 
+  /**
+   * C-24 (spec §9.2 [0.3]): how long a receive VIDEO stream holds frames of a known leg's next epoch(s) while their
+   * key is missing (default 10 s = the retention default); 0 turns holding off (such frames drop as unknown-kid).
+   */
+  public void setHoldTime(long holdMs) {
+    checkExists();
+    nativeSetHoldTime(nativeKeyStore, holdMs);
+  }
+
   public void setObserver(@Nullable Observer observer) {
     checkExists();
     nativeSetObserver(nativeKeyStore, observer);
@@ -141,6 +151,7 @@ public class SFrameKeyStore {
   private static native long nativeGetSendKid(long keyStore);
   private static native void nativeSetStormThreshold(long keyStore, int n);
   private static native void nativeSetH264Enabled(long keyStore, boolean enabled);
+  private static native void nativeSetHoldTime(long keyStore, long holdMs);
   private static native void nativeSetObserver(long keyStore, @Nullable Observer observer);
   private static native String nativeGetStatsJson(long keyStore);
   @Nullable

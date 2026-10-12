@@ -30,6 +30,7 @@
 
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
 #include <optional>
@@ -74,6 +75,10 @@ enum class SframeDropReason {
                   // header, bad escaping, mixed KIDs
   kNoSink,        // no TransformedFrameCallback registered for the frame's SSRC
   kInternal,      // direction mismatch, BoringSSL failure
+  kHeldExpired,   // receiver (video): held for the key of a known leg's next
+                  // epoch that never arrived within the hold time (C-24)
+  kHeldOverflow,  // receiver (video): the hold queue was full; the oldest held
+                  // frame was dropped (C-24)
   kCount
 };
 RTC_EXPORT const char* SframeDropReasonName(SframeDropReason reason);
@@ -94,6 +99,11 @@ struct RTC_EXPORT SframeStreamStats {
   uint64_t consecutive = 0;  // consecutive storm-counting drops (receiver)
   bool storm = false;  // spec §9.2 storm: the app pauses this subscription
   uint64_t storms = 0;
+  // Receiver video only (spec §9.2 [0.3], C-24): frames under a KID of a known
+  // leg's NEXT epoch(s) are held until their key arrives instead of dropped.
+  uint64_t held = 0;           // frames that entered the hold
+  uint64_t held_released = 0;  // of which opened and delivered when the key came
+  uint64_t held_now = 0;       // currently held
   std::optional<uint64_t> last_kid;
   std::optional<Timestamp> first_frame_at;
   std::optional<Timestamp> first_pass_at;
@@ -121,6 +131,10 @@ struct RTC_EXPORT SframeEvent {
     kKeyExpired,  // a retired key reached its retention deadline and was
                   // removed
     kKeyEvicted,  // a key was removed because its leg exceeded kMaxKeysPerLeg
+    kHeld,        // a receive stream started holding frames for `kid` (its key
+                  // is missing; C-24)
+    kReleased,    // `count` held frames of a receive stream were opened and
+                  // delivered after the key of `kid` arrived (C-24)
   };
   Type type = Type::kEngaged;
   std::string stream_id;  // empty for key events
@@ -130,6 +144,7 @@ struct RTC_EXPORT SframeEvent {
       SframeDropReason::kCount;  // kDropping / kStorm: the triggering reason
   std::optional<uint64_t> kid;
   uint64_t consecutive = 0;
+  uint64_t count = 0;  // kReleased: frames released
 };
 RTC_EXPORT const char* SframeEventTypeName(SframeEvent::Type type);
 
@@ -156,6 +171,18 @@ class RTC_EXPORT SframeKeyStore : public RefCountInterface {
   static constexpr size_t kMaxKeysPerLeg =
       4;  // spec §9.2 K-2: "a cap of a few epochs bounds memory"
   static constexpr int kDefaultStormThreshold = 30;
+  // C-24 (spec §9.2 [0.3]): a VIDEO frame whose KID has no key, but whose leg
+  // has a key for an epoch 1..kHoldEpochsAhead behind the frame's, is HELD
+  // until the key arrives (SetKey releases it, in order), at most `hold time`
+  // (default 10 s = the `retention` default), at most kMaxHeldFrames /
+  // kMaxHeldBytes per stream (beyond that the oldest is dropped
+  // kHeldOverflow). A dropped frame at an epoch switch breaks the VP8
+  // reference chain until a keyframe (a 0.5 s freeze per rotation, C-24);
+  // a held one costs only the key's lateness. Audio is never held (Opus PLC).
+  static constexpr uint32_t kHoldEpochsAhead = 8;
+  static constexpr size_t kMaxHeldFrames = 300;
+  static constexpr size_t kMaxHeldBytes = 8 * 1024 * 1024;
+  static constexpr int64_t kDefaultHoldMs = 10000;
 
   // `clock` = nullptr → the real-time clock.
   static scoped_refptr<SframeKeyStore> Create(Clock* clock = nullptr);
@@ -187,6 +214,9 @@ class RTC_EXPORT SframeKeyStore : public RefCountInterface {
   bool HasKey(uint64_t kid) const;
   // spec §9.2 [0.2] storm rule N (initial 30).
   void SetStormThreshold(int n);
+  // C-24: how long a receive video stream holds frames for a missing key of a
+  // known leg's next epoch; zero disables holding (frames drop as unknown-kid).
+  void SetHoldTime(TimeDelta hold);
   void SetObserver(scoped_refptr<SframeObserver> observer);
   std::vector<SframeStreamStats> GetAllStats() const;
 
@@ -227,18 +257,50 @@ class RTC_EXPORT SframeKeyStore : public RefCountInterface {
     uint64_t installed_seq = 0;
     std::optional<Timestamp> expires_at;
   };
+  struct HeldFrame {
+    std::unique_ptr<TransformableFrameInterface> frame;
+    uint64_t kid = 0;
+    Timestamp deadline = Timestamp::MinusInfinity();
+    size_t bytes = 0;
+  };
   struct Stream {
     SframeStreamStats stats;
     std::optional<SframeDropReason> last_reported_drop;
+    SframeTransformer* transformer = nullptr;  // delivers released frames
+    std::deque<HeldFrame> held;                // C-24, receiver video only
+    size_t held_bytes = 0;
+  };
+  struct Delivery {
+    scoped_refptr<TransformedFrameCallback> sink;
+    std::unique_ptr<TransformableFrameInterface> frame;
   };
   using Events = std::vector<SframeEvent>;
 
-  // The whole per-frame work, under `mutex_`. Returns false (frame dropped) or
-  // true with `out` = the new payload.
+  // The whole per-frame work, under `mutex_`. Returns false (frame dropped, or
+  // held: then `*held` is true and the store owns `frame`) or true with `out`
+  // = the new payload.
   bool Process(Stream* stream,
-               const TransformableFrameInterface& frame,
+               std::unique_ptr<TransformableFrameInterface>& frame,
                std::vector<uint8_t>* out,
-               Events* events);
+               Events* events,
+               bool* held);
+  // The bookkeeping of an opened / sealed frame (passed, first pass, storm
+  // recovery of the receiver).
+  void PassLocked(Stream* stream, uint64_t kid, size_t out_bytes, Events* events)
+      RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  // C-24
+  bool ShouldHoldLocked(const Stream* stream, uint64_t kid) const
+      RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  void HoldLocked(Stream* stream,
+                  std::unique_ptr<TransformableFrameInterface> frame,
+                  uint64_t kid,
+                  Events* events) RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  void ReleaseHeldLocked(uint64_t kid,
+                         Events* events,
+                         std::vector<Delivery>* deliveries)
+      RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  void ExpireHeldLocked(Events* events) RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  static void Deliver(std::vector<Delivery> deliveries);
   bool SealLocked(Stream* stream,
                   const TransformableFrameInterface& frame,
                   std::vector<uint8_t>* out,
@@ -260,7 +322,8 @@ class RTC_EXPORT SframeKeyStore : public RefCountInterface {
 
   Stream* RegisterStream(const std::string& stream_id,
                          SframeRole role,
-                         SframeMediaKind kind);
+                         SframeMediaKind kind,
+                         SframeTransformer* transformer);
   void UnregisterStream(Stream* stream);
   SframeStreamStats StatsOf(const Stream* stream) const;
 
@@ -272,6 +335,7 @@ class RTC_EXPORT SframeKeyStore : public RefCountInterface {
   uint64_t install_seq_ RTC_GUARDED_BY(mutex_) = 0;
   int storm_threshold_ RTC_GUARDED_BY(mutex_) = kDefaultStormThreshold;
   bool h264_enabled_ RTC_GUARDED_BY(mutex_) = false;
+  TimeDelta hold_time_ RTC_GUARDED_BY(mutex_) = TimeDelta::Millis(kDefaultHoldMs);
   std::vector<std::unique_ptr<Stream>> streams_ RTC_GUARDED_BY(mutex_);
   Mutex observer_mutex_;
   scoped_refptr<SframeObserver> observer_ RTC_GUARDED_BY(observer_mutex_);
@@ -312,6 +376,7 @@ class RTC_EXPORT SframeTransformer : public FrameTransformerInterface {
   ~SframeTransformer() override;
 
  private:
+  friend class SframeKeyStore;
   scoped_refptr<TransformedFrameCallback> SinkFor(uint32_t ssrc);
 
   const scoped_refptr<SframeKeyStore> store_;

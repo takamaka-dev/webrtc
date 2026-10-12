@@ -42,7 +42,7 @@ class SframeObserverJni : public SframeObserver {
         env, j_observer_, NativeToJavaString(env, SframeEventTypeName(e.type)),
         NativeToJavaString(env, e.stream_id), NativeToJavaString(env, reason),
         e.kid ? static_cast<jlong>(*e.kid) : -1,
-        static_cast<jlong>(e.consecutive));
+        static_cast<jlong>(e.consecutive), static_cast<jlong>(e.count));
   }
 
  private:
@@ -103,6 +103,9 @@ std::string StatsJson(const SframeStreamStats& s) {
   j += ",\"consecutive\":" + std::to_string(s.consecutive);
   j += ",\"storm\":" + std::string(s.storm ? "true" : "false");
   j += ",\"storms\":" + std::to_string(s.storms);
+  j += ",\"held\":" + std::to_string(s.held);
+  j += ",\"heldReleased\":" + std::to_string(s.held_released);
+  j += ",\"heldNow\":" + std::to_string(s.held_now);
   j += ",\"lastKid\":" +
        (s.last_kid ? std::to_string(*s.last_kid) : std::string("null"));
   j += ",\"firstFrameAtMs\":" + (s.first_frame_at
@@ -187,6 +190,12 @@ static void JNI_SFrameKeyStore_SetH264Enabled(JNIEnv* env,
                                               jlong j_store,
                                               jboolean j_enabled) {
   Store(j_store)->SetH264Enabled(j_enabled);
+}
+
+static void JNI_SFrameKeyStore_SetHoldTime(JNIEnv* env,
+                                           jlong j_store,
+                                           jlong j_hold_ms) {
+  Store(j_store)->SetHoldTime(TimeDelta::Millis(std::max<jlong>(0, j_hold_ms)));
 }
 
 static void JNI_SFrameKeyStore_SetObserver(

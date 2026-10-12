@@ -870,5 +870,195 @@ TEST(SframeTransformer,
   EXPECT_EQ(r->GetStats().dropped_total(), 0u);
 }
 
+
+// ---- C-24: hold video frames of a known leg's next epoch until the key
+// arrives
+// ---------------------------------------------------------------------------------------
+
+// Alice (leg 1) rotates from epoch 4 to 5 and seals under KID(1,5) before Bob
+// installed that key: Bob HOLDS the three frames (nothing dropped, nothing
+// passed), then opens all of them, in order, the moment the key lands — the
+// VP8 reference chain stays whole (no PLI, no freeze).
+TEST(SframeTransformer, VideoUnderTheNextEpochIsHeldUntilItsKeyArrives) {
+  SimulatedClock clock(Timestamp::Seconds(1000));
+  Leg alice(&clock), bob(&clock);
+  const uint64_t e4 = kUnitsKid, e5 = kUnitsKid + 1;  // KID(1,4), KID(1,5)
+  ASSERT_EQ(alice.store->SetKey(e4, kBase), SframeKeyStore::SetKeyResult::kChanged);
+  ASSERT_TRUE(alice.store->SetSendKid(e4));
+  ASSERT_EQ(bob.store->SetKey(e4, kBase), SframeKeyStore::SetKeyResult::kChanged);
+  auto sv = alice.Make(SframeRole::kSender, SframeMediaKind::kVideo, "sv");
+  auto rv = bob.Make(SframeRole::kReceiver, SframeMediaKind::kVideo, "rv");
+  auto& sent = alice.sinks["sv"]->frames;
+  auto& got = bob.sinks["rv"]->frames;
+
+  sv->Transform(VideoFrame({0x10, 1, 2, 3, 4}, Direction::kSender));
+  rv->Transform(VideoFrame(sent[0], Direction::kReceiver));
+  ASSERT_EQ(got.size(), 1u);
+
+  // the switch at the sender; Bob's key for e5 is late
+  ASSERT_EQ(alice.store->SetKey(e5, OtherBase()), SframeKeyStore::SetKeyResult::kChanged);
+  ASSERT_TRUE(alice.store->SetSendKid(e5));
+  for (uint8_t i = 1; i <= 3; ++i) {
+    sv->Transform(VideoFrame({0x10, i, i, i}, Direction::kSender));
+    clock.AdvanceTime(TimeDelta::Millis(66));
+  }
+  for (size_t i = 1; i <= 3; ++i) {
+    rv->Transform(VideoFrame(sent[i], Direction::kReceiver));
+  }
+  SframeStreamStats st = rv->GetStats();
+  EXPECT_EQ(got.size(), 1u) << "nothing passes while the key is missing";
+  EXPECT_EQ(st.dropped_total(), 0u) << "held, not dropped";
+  EXPECT_EQ(st.held, 3u);
+  EXPECT_EQ(st.held_now, 3u);
+  EXPECT_EQ(st.frames, 4u);
+  EXPECT_EQ(st.consecutive, 0u) << "a held frame does not count toward the storm";
+  EXPECT_EQ(bob.recorder->Count(SframeEvent::Type::kHeld, "rv"), 1);
+
+  // the key lands: every held frame opens, in order, delivered by SetKey
+  ASSERT_EQ(bob.store->SetKey(e5, OtherBase()), SframeKeyStore::SetKeyResult::kChanged);
+  ASSERT_EQ(got.size(), 4u);
+  for (uint8_t i = 1; i <= 3; ++i) {
+    EXPECT_EQ(got[i], std::vector<uint8_t>({0x10, i, i, i}));
+  }
+  st = rv->GetStats();
+  EXPECT_EQ(st.held_released, 3u);
+  EXPECT_EQ(st.held_now, 0u);
+  EXPECT_EQ(st.passed, 4u);
+  EXPECT_EQ(st.dropped_total(), 0u);
+  ASSERT_EQ(bob.recorder->Count(SframeEvent::Type::kReleased, "rv"), 1);
+  for (const SframeEvent& e : bob.recorder->events) {
+    if (e.type == SframeEvent::Type::kReleased) {
+      EXPECT_EQ(e.count, 3u);
+      EXPECT_EQ(e.kid, e5);
+    }
+  }
+  // the stream keeps working live under e5 (replay window continued)
+  sv->Transform(VideoFrame({0x10, 9}, Direction::kSender));
+  rv->Transform(VideoFrame(sent[4], Direction::kReceiver));
+  EXPECT_EQ(got.size(), 5u);
+  EXPECT_EQ(rv->GetStats().dropped_total(), 0u);
+}
+
+// A key that never comes: the held frames drop after the hold time
+// (held-expired, counting toward the storm like unknown-kid); the queue is
+// bounded (the oldest drops as held-overflow); SetHoldTime(0) turns holding
+// off (plain unknown-kid drops).
+TEST(SframeTransformer, HeldFramesExpireAndTheHoldIsBounded) {
+  SimulatedClock clock(Timestamp::Seconds(1000));
+  Leg alice(&clock), bob(&clock);
+  const uint64_t e4 = kUnitsKid, e5 = kUnitsKid + 1;
+  ASSERT_EQ(alice.store->SetKey(e5, kBase), SframeKeyStore::SetKeyResult::kChanged);
+  ASSERT_TRUE(alice.store->SetSendKid(e5));
+  ASSERT_EQ(bob.store->SetKey(e4, kBase), SframeKeyStore::SetKeyResult::kChanged);
+  auto sv = alice.Make(SframeRole::kSender, SframeMediaKind::kVideo, "sv");
+  auto rv = bob.Make(SframeRole::kReceiver, SframeMediaKind::kVideo, "rv");
+  auto& sent = alice.sinks["sv"]->frames;
+
+  // expiry: 2 frames held at t0, the hold time (10 s) passes, the next
+  // frame's processing purges them
+  sv->Transform(VideoFrame({0x10, 1}, Direction::kSender));
+  sv->Transform(VideoFrame({0x10, 2}, Direction::kSender));
+  rv->Transform(VideoFrame(sent[0], Direction::kReceiver));
+  rv->Transform(VideoFrame(sent[1], Direction::kReceiver));
+  EXPECT_EQ(rv->GetStats().held_now, 2u);
+  clock.AdvanceTime(TimeDelta::Millis(SframeKeyStore::kDefaultHoldMs - 1));
+  sv->Transform(VideoFrame({0x10, 3}, Direction::kSender));
+  rv->Transform(VideoFrame(sent[2], Direction::kReceiver));  // held too
+  EXPECT_EQ(rv->GetStats().held_now, 3u);
+  EXPECT_EQ(Dropped(rv->GetStats(), SframeDropReason::kHeldExpired), 0u);
+  clock.AdvanceTime(TimeDelta::Millis(1));
+  bob.store->SetSendKid(e4);  // any store entry purges: the first two expire
+  SframeStreamStats st = rv->GetStats();
+  EXPECT_EQ(Dropped(st, SframeDropReason::kHeldExpired), 2u);
+  EXPECT_EQ(st.held_now, 1u);
+  EXPECT_EQ(st.consecutive, 2u) << "an expired hold is an unknown-kid drop that waited";
+  EXPECT_EQ(st.drop_samples.size(), 2u);
+  EXPECT_EQ(st.drop_samples[0].rfind("held-expired len=", 0), 0u);
+  // the late key still opens the third frame
+  ASSERT_EQ(bob.store->SetKey(e5, kBase), SframeKeyStore::SetKeyResult::kChanged);
+  EXPECT_EQ(bob.sinks["rv"]->frames.size(), 1u);
+  EXPECT_EQ(rv->GetStats().held_now, 0u);
+
+  // bound: a second rotation the receiver never learns of; the queue keeps
+  // the newest kMaxHeldFrames
+  const uint64_t e6 = kUnitsKid + 2;
+  ASSERT_EQ(alice.store->SetKey(e6, OtherBase()), SframeKeyStore::SetKeyResult::kChanged);
+  ASSERT_TRUE(alice.store->SetSendKid(e6));
+  const size_t before = sent.size();
+  for (size_t i = 0; i < SframeKeyStore::kMaxHeldFrames + 5; ++i) {
+    sv->Transform(VideoFrame({0x10, static_cast<uint8_t>(i)}, Direction::kSender));
+    rv->Transform(VideoFrame(sent[before + i], Direction::kReceiver));
+  }
+  st = rv->GetStats();
+  EXPECT_EQ(st.held_now, SframeKeyStore::kMaxHeldFrames);
+  EXPECT_EQ(Dropped(st, SframeDropReason::kHeldOverflow), 5u);
+  EXPECT_EQ(st.consecutive, 5u) << "an overflowing hold counts like unknown-kid drops (toward N = 30)";
+
+  // holding off: the queue drains as expired, new frames drop at once
+  bob.store->SetHoldTime(TimeDelta::Zero());
+  st = rv->GetStats();
+  EXPECT_EQ(st.held_now, 0u);
+  EXPECT_EQ(Dropped(st, SframeDropReason::kHeldExpired), 2u + SframeKeyStore::kMaxHeldFrames);
+  sv->Transform(VideoFrame({0x10, 7}, Direction::kSender));
+  rv->Transform(VideoFrame(sent.back(), Direction::kReceiver));
+  EXPECT_EQ(Dropped(rv->GetStats(), SframeDropReason::kUnknownKid), 1u);
+}
+
+// Only VIDEO of a KNOWN leg, 1..kHoldEpochsAhead epochs AHEAD, is held: audio
+// drops (Opus PLC), an unknown leg drops (the relay's blank frame, a stranger),
+// an epoch behind the window drops (its key expired), an epoch too far ahead
+// drops; the epoch field wraps mod 2^16.
+TEST(SframeTransformer, OnlyVideoOfAKnownLegsNextEpochsIsHeld) {
+  Leg alice, bob;
+  auto kid = [](uint32_t leg, uint64_t epoch) { return *sframe::MakeKid(leg, epoch); };
+  ASSERT_EQ(bob.store->SetKey(kid(1, 65535), kBase), SframeKeyStore::SetKeyResult::kChanged);
+  auto sv = alice.Make(SframeRole::kSender, SframeMediaKind::kVideo, "sv");
+  auto sa = alice.Make(SframeRole::kSender, SframeMediaKind::kAudio, "sa");
+  auto rv = bob.Make(SframeRole::kReceiver, SframeMediaKind::kVideo, "rv");
+  auto ra = bob.Make(SframeRole::kReceiver, SframeMediaKind::kAudio, "ra");
+  auto seal = [&](uint64_t k, SframeMediaKind kind) {
+    ASSERT_NE(alice.store->SetKey(k, kBase), SframeKeyStore::SetKeyResult::kInvalid);
+    ASSERT_TRUE(alice.store->SetSendKid(k));
+    if (kind == SframeMediaKind::kVideo) {
+      sv->Transform(VideoFrame({0x10, 1, 2}, Direction::kSender));
+      rv->Transform(VideoFrame(alice.sinks["sv"]->frames.back(), Direction::kReceiver));
+    } else {
+      sa->Transform(AudioFrame({0x78, 1, 2}, Direction::kSender));
+      ra->Transform(AudioFrame(alice.sinks["sa"]->frames.back(), Direction::kReceiver));
+    }
+  };
+  seal(kid(1, 65536), SframeMediaKind::kVideo);  // epoch 65536 ≡ 0: one ahead of 65535 (wrap)
+  EXPECT_EQ(rv->GetStats().held_now, 1u);
+  seal(kid(1, 65535 + SframeKeyStore::kHoldEpochsAhead), SframeMediaKind::kVideo);
+  EXPECT_EQ(rv->GetStats().held_now, 2u);
+  seal(kid(1, 65535 + SframeKeyStore::kHoldEpochsAhead + 1), SframeMediaKind::kVideo);  // too far ahead
+  EXPECT_EQ(rv->GetStats().held_now, 2u);
+  EXPECT_EQ(Dropped(rv->GetStats(), SframeDropReason::kUnknownKid), 1u);
+  seal(kid(1, 65534), SframeMediaKind::kVideo);  // behind: its key is gone
+  EXPECT_EQ(Dropped(rv->GetStats(), SframeDropReason::kUnknownKid), 2u);
+  seal(kid(2, 65536), SframeMediaKind::kVideo);  // an unknown leg
+  EXPECT_EQ(Dropped(rv->GetStats(), SframeDropReason::kUnknownKid), 3u);
+  seal(kid(1, 65536), SframeMediaKind::kAudio);  // audio: never held
+  EXPECT_EQ(ra->GetStats().held_now, 0u);
+  EXPECT_EQ(Dropped(ra->GetStats(), SframeDropReason::kUnknownKid), 1u);
+  EXPECT_EQ(rv->GetStats().held_now, 2u);
+  // the two keys arrive in any order: each releases its own frame
+  ASSERT_EQ(bob.store->SetKey(kid(1, 65535 + SframeKeyStore::kHoldEpochsAhead), kBase),
+            SframeKeyStore::SetKeyResult::kChanged);
+  EXPECT_EQ(bob.sinks["rv"]->frames.size(), 1u);
+  EXPECT_EQ(rv->GetStats().held_now, 1u);
+  ASSERT_EQ(bob.store->SetKey(kid(1, 65536), kBase), SframeKeyStore::SetKeyResult::kChanged);
+  EXPECT_EQ(bob.sinks["rv"]->frames.size(), 2u);
+  EXPECT_EQ(rv->GetStats().held_now, 0u);
+  EXPECT_EQ(rv->GetStats().held_released, 2u);
+  // a frame the sink cannot take any more (unregistered) drops as no-sink on release
+  seal(kid(1, 65537), SframeMediaKind::kVideo);
+  EXPECT_EQ(rv->GetStats().held_now, 1u);
+  rv->UnregisterTransformedFrameCallback();
+  ASSERT_EQ(bob.store->SetKey(kid(1, 65537), kBase), SframeKeyStore::SetKeyResult::kChanged);
+  EXPECT_EQ(Dropped(rv->GetStats(), SframeDropReason::kNoSink), 1u);
+  EXPECT_EQ(rv->GetStats().held_now, 0u);
+}
+
 }  // namespace
 }  // namespace webrtc
