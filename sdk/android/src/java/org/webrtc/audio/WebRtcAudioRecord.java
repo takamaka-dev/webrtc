@@ -669,7 +669,7 @@ class WebRtcAudioRecord {
       if (preferMicrophoneTowardsUser && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
         try {
           boolean ok = audioRecord.setPreferredMicrophoneDirection(MicrophoneDirection.MIC_DIRECTION_TOWARDS_USER);
-          Logging.d(TAG, "tkm C-25: setPreferredMicrophoneDirection(TOWARDS_USER) = " + ok);
+          Logging.w(TAG, "tkm C-25: setPreferredMicrophoneDirection(TOWARDS_USER) = " + ok); // warn: visible in release logcat
         } catch (RuntimeException e) {
           Logging.w(TAG, "tkm C-25: setPreferredMicrophoneDirection failed: " + e.getMessage());
         }
