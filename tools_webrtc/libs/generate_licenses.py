@@ -91,11 +91,6 @@ LIB_TO_LICENSES_DICT = {
     # Compile time dependencies, no license needed:
     'ow2_asm': [],
     'jdk': [],
-
-    'catapult': [],
-    'google_benchmark': [],
-    'googletest': [],
-    'vinn': [],
 }
 
 # Third_party library _regex_ to licences mapping. Keys are regular expression
