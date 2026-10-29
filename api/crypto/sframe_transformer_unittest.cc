@@ -1060,5 +1060,183 @@ TEST(SframeTransformer, OnlyVideoOfAKnownLegsNextEpochsIsHeld) {
   EXPECT_EQ(rv->GetStats().held_now, 0u);
 }
 
+// ---- S-7: leg binding (a relay participant ↔ the KIDs of its frames)
+// ----------------------------------------------------------------------------
+
+// Alice is leg 1, Carol leg 2; Bob holds both keys (one store per call). Bob's
+// receive stream for Alice's track, bound to leg 1, opens Alice's frames and
+// drops Carol's as wrong-leg — the relay cannot route Carol's media under
+// Alice's identity. A wrong-leg frame touches nothing: no replay window (the
+// same unit still opens on Carol's own stream), no last_kid.
+TEST(SframeTransformer, BoundReceiverOpensOnlyItsOwnLegsKids) {
+  Leg alice, carol, bob;
+  auto kid = [](uint32_t leg, uint64_t epoch) { return *sframe::MakeKid(leg, epoch); };
+  ASSERT_EQ(alice.store->SetKey(kid(1, 4), kBase), SframeKeyStore::SetKeyResult::kChanged);
+  ASSERT_TRUE(alice.store->SetSendKid(kid(1, 4)));
+  ASSERT_EQ(carol.store->SetKey(kid(2, 4), OtherBase()), SframeKeyStore::SetKeyResult::kChanged);
+  ASSERT_TRUE(carol.store->SetSendKid(kid(2, 4)));
+  ASSERT_EQ(bob.store->SetKey(kid(1, 4), kBase), SframeKeyStore::SetKeyResult::kChanged);
+  ASSERT_EQ(bob.store->SetKey(kid(2, 4), OtherBase()), SframeKeyStore::SetKeyResult::kChanged);
+  auto sa = alice.Make(SframeRole::kSender, SframeMediaKind::kAudio, "sa");
+  auto sc = carol.Make(SframeRole::kSender, SframeMediaKind::kAudio, "sc");
+  auto ra = bob.Make(SframeRole::kReceiver, SframeMediaKind::kAudio, "recv:audio:alice");
+  auto rc = bob.Make(SframeRole::kReceiver, SframeMediaKind::kAudio, "recv:audio:carol");
+  sa->Transform(AudioFrame({0x78, 1, 1}, Direction::kSender));
+  sc->Transform(AudioFrame({0x78, 2, 2}, Direction::kSender));
+  const std::vector<uint8_t> from_alice = alice.sinks["sa"]->frames.back();
+  const std::vector<uint8_t> from_carol = carol.sinks["sc"]->frames.back();
+
+  ASSERT_TRUE(bob.store->BindLeg("recv:audio:alice", 1));
+  EXPECT_EQ(ra->GetStats().bound_leg, std::optional<uint32_t>(1));
+  ra->Transform(AudioFrame(from_carol, Direction::kReceiver));  // re-routed
+  SframeStreamStats st = ra->GetStats();
+  EXPECT_EQ(Dropped(st, SframeDropReason::kWrongLeg), 1u);
+  EXPECT_EQ(st.passed, 0u);
+  EXPECT_FALSE(st.last_kid.has_value()) << "a wrong-leg KID is not this stream's history";
+  EXPECT_EQ(st.consecutive, 1u) << "Q3: wrong-leg counts toward the storm";
+  ASSERT_EQ(st.drop_samples.size(), 1u);
+  EXPECT_EQ(st.drop_samples[0].rfind("wrong-leg len=", 0), 0u);
+  ra->Transform(AudioFrame(from_alice, Direction::kReceiver));
+  EXPECT_EQ(bob.sinks["recv:audio:alice"]->frames.size(), 1u);
+  EXPECT_EQ(ra->GetStats().consecutive, 0u);
+  // Carol's unit never reached the replay window: it still opens where it
+  // belongs (rc bound to leg 2 through the transformer API).
+  ASSERT_TRUE(rc->BindLeg(2));
+  rc->Transform(AudioFrame(from_carol, Direction::kReceiver));
+  EXPECT_EQ(bob.sinks["recv:audio:carol"]->frames.size(), 1u);
+  EXPECT_EQ(Dropped(rc->GetStats(), SframeDropReason::kReplay), 0u);
+  // Without a binding and without require_leg_binding (the pre-tkm.9
+  // behaviour) any installed KID opens: the filter is the binding.
+  auto rx = bob.Make(SframeRole::kReceiver, SframeMediaKind::kAudio, "rx");
+  sc->Transform(AudioFrame({0x78, 3}, Direction::kSender));
+  rx->Transform(AudioFrame(carol.sinks["sc"]->frames.back(), Direction::kReceiver));
+  EXPECT_EQ(bob.sinks["rx"]->frames.size(), 1u);
+}
+
+// Q1: with require_leg_binding an unbound receive stream opens NOTHING (the
+// participant is not, or no longer, in the verified roster) — 'unbound', and
+// it counts toward the storm (Q3). Binding resumes a stormed stream with a
+// fresh count; unbinding closes it again. BindLeg refuses unknown streams,
+// senders and reserved leg indexes.
+TEST(SframeTransformer, RequiredBindingDropsUnboundFramesUntilBound) {
+  Leg alice, bob;
+  bob.store->SetRequireLegBinding(true);
+  EXPECT_TRUE(bob.store->require_leg_binding());
+  ASSERT_EQ(alice.store->SetKey(kUnitsKid, kBase), SframeKeyStore::SetKeyResult::kChanged);
+  ASSERT_TRUE(alice.store->SetSendKid(kUnitsKid));
+  ASSERT_EQ(bob.store->SetKey(kUnitsKid, kBase), SframeKeyStore::SetKeyResult::kChanged);
+  auto sv = alice.Make(SframeRole::kSender, SframeMediaKind::kVideo, "sv");
+  auto rv = bob.Make(SframeRole::kReceiver, SframeMediaKind::kVideo, "rv");
+  auto& sent = alice.sinks["sv"]->frames;
+  auto& got = bob.sinks["rv"]->frames;
+  for (int i = 0; i < SframeKeyStore::kDefaultStormThreshold; ++i) {
+    sv->Transform(VideoFrame({0x10, static_cast<uint8_t>(i)}, Direction::kSender));
+    rv->Transform(VideoFrame(sent.back(), Direction::kReceiver));
+  }
+  SframeStreamStats st = rv->GetStats();
+  EXPECT_TRUE(got.empty()) << "Q1: an unbound receiver never opens";
+  EXPECT_EQ(Dropped(st, SframeDropReason::kUnbound),
+            static_cast<uint64_t>(SframeKeyStore::kDefaultStormThreshold));
+  EXPECT_TRUE(st.storm) << "Q3: unbound drops count toward the storm";
+  EXPECT_EQ(bob.recorder->Count(SframeEvent::Type::kStorm, "rv"), 1);
+  EXPECT_EQ(st.held_now, 0u) << "an unbound stream holds nothing";
+
+  EXPECT_FALSE(bob.store->BindLeg("nope", 1));
+  EXPECT_FALSE(bob.store->BindLeg("rv", 0)) << "leg_index 0 is reserved";
+  EXPECT_FALSE(bob.store->BindLeg("rv", 0x10000));
+  EXPECT_FALSE(sv->BindLeg(1)) << "a sender has no leg to bind";
+  EXPECT_FALSE(rv->GetStats().bound_leg.has_value());
+
+  ASSERT_TRUE(bob.store->BindLeg("rv", 1));
+  st = rv->GetStats();
+  EXPECT_FALSE(st.storm);
+  EXPECT_EQ(st.consecutive, 0u);
+  EXPECT_EQ(bob.recorder->Count(SframeEvent::Type::kResumed, "rv"), 1);
+  sv->Transform(VideoFrame({0x10, 0x55}, Direction::kSender));
+  rv->Transform(VideoFrame(sent.back(), Direction::kReceiver));
+  ASSERT_EQ(got.size(), 1u);
+  EXPECT_EQ(got[0], std::vector<uint8_t>({0x10, 0x55}));
+  ASSERT_TRUE(bob.store->BindLeg("rv", 1));  // the same leg again: a no-op
+  EXPECT_EQ(bob.recorder->Count(SframeEvent::Type::kResumed, "rv"), 1);
+
+  // The participant leaves the verified roster: unbound again, nothing opens.
+  ASSERT_TRUE(bob.store->BindLeg("rv", std::nullopt));
+  sv->Transform(VideoFrame({0x10, 0x56}, Direction::kSender));
+  rv->Transform(VideoFrame(sent.back(), Direction::kReceiver));
+  EXPECT_EQ(got.size(), 1u);
+  EXPECT_EQ(Dropped(rv->GetStats(), SframeDropReason::kUnbound),
+            static_cast<uint64_t>(SframeKeyStore::kDefaultStormThreshold) + 1);
+}
+
+// C-24 × S-7: a bound stream holds only for ITS leg's next epoch; the next
+// epoch of another known leg drops wrong-leg at once. A rebind drops what was
+// held for the old leg.
+TEST(SframeTransformer, BoundStreamHoldsOnlyForItsOwnLeg) {
+  Leg alice, bob;
+  auto kid = [](uint32_t leg, uint64_t epoch) { return *sframe::MakeKid(leg, epoch); };
+  ASSERT_EQ(bob.store->SetKey(kid(1, 4), kBase), SframeKeyStore::SetKeyResult::kChanged);
+  ASSERT_EQ(bob.store->SetKey(kid(2, 4), kBase), SframeKeyStore::SetKeyResult::kChanged);
+  auto sv = alice.Make(SframeRole::kSender, SframeMediaKind::kVideo, "sv");
+  auto rv = bob.Make(SframeRole::kReceiver, SframeMediaKind::kVideo, "rv");
+  ASSERT_TRUE(rv->BindLeg(1));
+  auto seal = [&](uint64_t k) {
+    ASSERT_NE(alice.store->SetKey(k, kBase), SframeKeyStore::SetKeyResult::kInvalid);
+    ASSERT_TRUE(alice.store->SetSendKid(k));
+    sv->Transform(VideoFrame({0x10, 1, 2}, Direction::kSender));
+    rv->Transform(VideoFrame(alice.sinks["sv"]->frames.back(), Direction::kReceiver));
+  };
+  seal(kid(1, 5));  // its own leg's next epoch: held
+  EXPECT_EQ(rv->GetStats().held_now, 1u);
+  seal(kid(2, 5));  // a known leg's next epoch, but not this stream's
+  SframeStreamStats st = rv->GetStats();
+  EXPECT_EQ(st.held_now, 1u);
+  EXPECT_EQ(Dropped(st, SframeDropReason::kWrongLeg), 1u);
+  EXPECT_EQ(st.consecutive, 1u);
+  // rebind to leg 2: the frame held for leg 1 goes, the count restarts
+  ASSERT_TRUE(rv->BindLeg(2));
+  st = rv->GetStats();
+  EXPECT_EQ(st.held_now, 0u);
+  EXPECT_EQ(Dropped(st, SframeDropReason::kWrongLeg), 2u);
+  EXPECT_EQ(st.consecutive, 0u);
+  ASSERT_EQ(bob.store->SetKey(kid(1, 5), kBase), SframeKeyStore::SetKeyResult::kChanged);
+  EXPECT_TRUE(bob.sinks["rv"]->frames.empty()) << "nothing of leg 1 is released into a leg-2 stream";
+  EXPECT_EQ(rv->GetStats().held_released, 0u);
+}
+
+// H.264 units are filtered the same way (the leg check runs per slice, before
+// the key lookup).
+TEST(SframeTransformer, H264UnitsOfAnotherLegAreDroppedWrongLeg) {
+  Leg alice, bob;
+  alice.store->SetH264Enabled(true);
+  bob.store->SetH264Enabled(true);
+  bob.store->SetRequireLegBinding(true);
+  ASSERT_EQ(alice.store->SetKey(kUnitsKid, kBase), SframeKeyStore::SetKeyResult::kChanged);
+  ASSERT_TRUE(alice.store->SetSendKid(kUnitsKid));
+  ASSERT_EQ(bob.store->SetKey(kUnitsKid, kBase), SframeKeyStore::SetKeyResult::kChanged);
+  auto sv = alice.Make(SframeRole::kSender, SframeMediaKind::kVideo, "sv");
+  auto rv = bob.Make(SframeRole::kReceiver, SframeMediaKind::kVideo, "rv");
+  const std::vector<uint8_t> idr =
+      AnnexB({kSps, kPps, Slice({0x65, 0x88, 0x84}, 300, 7)});
+  sv->Transform(VideoFrame(idr, Direction::kSender, "video/H264"));
+  ASSERT_EQ(alice.sinks["sv"]->frames.size(), 1u);
+  const std::vector<uint8_t> unit = alice.sinks["sv"]->frames[0];
+  rv->Transform(VideoFrame(unit, Direction::kReceiver, "video/H264"));
+  EXPECT_EQ(Dropped(rv->GetStats(), SframeDropReason::kUnbound), 1u);
+  ASSERT_TRUE(rv->BindLeg(2));
+  rv->Transform(VideoFrame(unit, Direction::kReceiver, "video/H264"));
+  EXPECT_EQ(Dropped(rv->GetStats(), SframeDropReason::kWrongLeg), 1u);
+  ASSERT_TRUE(rv->BindLeg(1));
+  rv->Transform(VideoFrame(unit, Direction::kReceiver, "video/H264"));
+  ASSERT_EQ(bob.sinks["rv"]->frames.size(), 1u);
+  EXPECT_EQ(bob.sinks["rv"]->frames[0], idr);
+}
+
+TEST(SframeTransformer, LegBindingDropReasonNames) {
+  EXPECT_STREQ(SframeDropReasonName(SframeDropReason::kUnbound), "unbound");
+  EXPECT_STREQ(SframeDropReasonName(SframeDropReason::kWrongLeg), "wrong-leg");
+  EXPECT_TRUE(SframeDropCountsForStorm(SframeDropReason::kUnbound));
+  EXPECT_TRUE(SframeDropCountsForStorm(SframeDropReason::kWrongLeg));
+}
+
 }  // namespace
 }  // namespace webrtc

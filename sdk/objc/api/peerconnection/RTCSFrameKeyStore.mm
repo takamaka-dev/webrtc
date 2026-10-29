@@ -114,6 +114,7 @@ std::string RTCSFrameStatsJson(const SframeStreamStats& s) {
   j += ",\"held\":" + std::to_string(s.held);
   j += ",\"heldReleased\":" + std::to_string(s.held_released);
   j += ",\"heldNow\":" + std::to_string(s.held_now);
+  j += ",\"boundLeg\":" + (s.bound_leg ? std::to_string(*s.bound_leg) : std::string("null"));  // S-7
   j += ",\"lastKid\":" + (s.last_kid ? std::to_string(*s.last_kid) : std::string("null"));
   j += ",\"firstFrameAtMs\":" + OptionalMs(s.first_frame_at);
   j += ",\"firstPassAtMs\":" + OptionalMs(s.first_pass_at);
@@ -200,6 +201,20 @@ std::string RTCSFrameStatsJson(const SframeStreamStats& s) {
 
 - (void)setH264Enabled:(BOOL)enabled {
   _nativeKeyStore->SetH264Enabled(enabled);
+}
+
+- (void)setRequireLegBinding:(BOOL)required {
+  _nativeKeyStore->SetRequireLegBinding(required);
+}
+
+- (BOOL)bindLeg:(NSInteger)legIndex streamId:(NSString *)streamId {
+  if (streamId == nil) {
+    return NO;
+  }
+  // S-7: legIndex < 0 = unbind
+  return _nativeKeyStore->BindLeg(
+      [streamId stdString],
+      legIndex < 0 ? std::nullopt : std::optional<uint32_t>(static_cast<uint32_t>(legIndex)));
 }
 
 - (NSString *)statsJson {

@@ -41,6 +41,15 @@ public class SFrameCryptor {
   }
 
   /**
+   * S-7: binds this receive transformer to {@code legIndex} (1..65535) or unbinds it ({@code legIndex} &lt; 0); see
+   * {@link SFrameKeyStore#bindLeg}. False on a sender or a reserved index.
+   */
+  public boolean bindLeg(int legIndex) {
+    checkExists();
+    return nativeBindLeg(nativeCryptor, legIndex);
+  }
+
+  /**
    * Releases the Java handle. The transformer stays attached to its sender/receiver (WebRTC keeps a reference) and
    * keeps sealing/opening with its key store: disposing never turns encryption off.
    */
@@ -59,4 +68,5 @@ public class SFrameCryptor {
   private static native long nativeCreateForRtpSender(long rtpSender, long keyStore, int kind, String streamId);
   private static native long nativeCreateForRtpReceiver(long rtpReceiver, long keyStore, int kind, String streamId);
   private static native String nativeGetStatsJson(long cryptor);
+  private static native boolean nativeBindLeg(long cryptor, int legIndex);
 }

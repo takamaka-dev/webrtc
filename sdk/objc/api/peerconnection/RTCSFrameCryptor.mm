@@ -72,6 +72,12 @@ static webrtc::SframeMediaKind NativeKind(RTCSFrameMediaKind kind) {
   return self;
 }
 
+- (BOOL)bindLeg:(NSInteger)legIndex {
+  // S-7: legIndex < 0 = unbind
+  return _transformer->BindLeg(
+      legIndex < 0 ? std::nullopt : std::optional<uint32_t>(static_cast<uint32_t>(legIndex)));
+}
+
 - (NSString *)statsJson {
   return [NSString stringForStdString:webrtc::RTCSFrameStatsJson(_transformer->GetStats())];
 }

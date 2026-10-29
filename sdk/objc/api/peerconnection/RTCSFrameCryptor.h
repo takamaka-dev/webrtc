@@ -38,6 +38,12 @@ RTC_OBJC_EXPORT
                                    mediaKind:(RTCSFrameMediaKind)mediaKind
                                     streamId:(NSString *)streamId;
 
+/**
+ * S-7: binds this receive transformer to `legIndex` (1..65535) or unbinds it (`legIndex` < 0); see
+ * -[RTCSFrameKeyStore bindLeg:streamId:]. NO on a sender or a reserved index.
+ */
+- (BOOL)bindLeg:(NSInteger)legIndex;
+
 /** Counters of this stream as a JSON object. */
 - (NSString *)statsJson;
 

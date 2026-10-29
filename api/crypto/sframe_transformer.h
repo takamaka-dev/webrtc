@@ -18,6 +18,9 @@
  * frames fail and are dropped);
  *   - no default key, no implicit key fallback, no ratchet: a frame is opened
  * only by the key of its own KID;
+ *   - leg binding (S-7): a receive stream bound to a leg opens only KIDs of
+ * that leg, and with require_leg_binding an unbound one opens nothing — the
+ * relay cannot route one member's frames under another participant's track;
  *   - nonce = salt XOR CTR with a CTR per KID that never repeats within this
  * key store's life;
  *   - zero-length frames dropped; codecs other than Opus / VP8 (H.264 only when
@@ -79,6 +82,11 @@ enum class SframeDropReason {
                   // epoch that never arrived within the hold time (C-24)
   kHeldOverflow,  // receiver (video): the hold queue was full; the oldest held
                   // frame was dropped (C-24)
+  kUnbound,       // receiver: the store requires a leg binding and this stream
+                  // has none yet (S-7, ruling Q1: fail closed)
+  kWrongLeg,      // receiver: the frame's KID belongs to another leg than the
+                  // one this stream is bound to (S-7: a relay re-routing a
+                  // member's frames under another participant's identity)
   kCount
 };
 RTC_EXPORT const char* SframeDropReasonName(SframeDropReason reason);
@@ -104,6 +112,10 @@ struct RTC_EXPORT SframeStreamStats {
   uint64_t held = 0;           // frames that entered the hold
   uint64_t held_released = 0;  // of which opened and delivered when the key came
   uint64_t held_now = 0;       // currently held
+  // Receiver only (S-7): the leg_index this stream renders (the verified
+  // roster's index of the relay participant whose track it is), set by
+  // BindLeg; nullopt = unbound.
+  std::optional<uint32_t> bound_leg;
   std::optional<uint64_t> last_kid;
   std::optional<Timestamp> first_frame_at;
   std::optional<Timestamp> first_pass_at;
@@ -220,6 +232,22 @@ class RTC_EXPORT SframeKeyStore : public RefCountInterface {
   void SetObserver(scoped_refptr<SframeObserver> observer);
   std::vector<SframeStreamStats> GetAllStats() const;
 
+  // S-7 (ruling Q1): when on, a receive stream opens frames ONLY after BindLeg
+  // gave it a leg, and only under KIDs of that leg (kid >> 16): unbound →
+  // drop kUnbound, another leg → drop kWrongLeg (both count toward the storm,
+  // ruling Q3). Off (the default, for the pre-tkm.9 callers): an unbound
+  // stream opens any installed KID, as before; a bound one is still filtered.
+  // Call once at creation, before frames flow.
+  void SetRequireLegBinding(bool required);
+  bool require_leg_binding() const;
+  // S-7: binds every receive stream labelled `stream_id` to `leg_index`
+  // (1..65535), or unbinds it (nullopt). A change of binding drops the frames
+  // that stream holds (C-24: they were held for the old leg) and resets its
+  // storm state (kResumed if it was stormed): the drops before the binding
+  // are not the new leg's fault. False if no receive stream has that label or
+  // `leg_index` is not assignable (0 or > 0xFFFF).
+  bool BindLeg(const std::string& stream_id, std::optional<uint32_t> leg_index);
+
   // Must be called once before frames flow: enables H.264 (spec §9.2 [0.2]
   // fallback layout). Default OFF: H.264 is dropped like any other codec until
   // the layout is fixed by test (a) on the fork (OPEN H-1 of the M1 report).
@@ -288,6 +316,14 @@ class RTC_EXPORT SframeKeyStore : public RefCountInterface {
   // recovery of the receiver).
   void PassLocked(Stream* stream, uint64_t kid, size_t out_bytes, Events* events)
       RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  // S-7: nullopt when the stream may open `kid`, else kUnbound / kWrongLeg.
+  std::optional<SframeDropReason> LegCheckLocked(const Stream* stream,
+                                                 uint64_t kid) const
+      RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  bool BindStreamLeg(Stream* stream, std::optional<uint32_t> leg_index);
+  bool BindLegLocked(Stream* stream,
+                     std::optional<uint32_t> leg_index,
+                     Events* events) RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
   // C-24
   bool ShouldHoldLocked(const Stream* stream, uint64_t kid) const
       RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
@@ -335,6 +371,7 @@ class RTC_EXPORT SframeKeyStore : public RefCountInterface {
   uint64_t install_seq_ RTC_GUARDED_BY(mutex_) = 0;
   int storm_threshold_ RTC_GUARDED_BY(mutex_) = kDefaultStormThreshold;
   bool h264_enabled_ RTC_GUARDED_BY(mutex_) = false;
+  bool require_leg_binding_ RTC_GUARDED_BY(mutex_) = false;  // S-7
   TimeDelta hold_time_ RTC_GUARDED_BY(mutex_) = TimeDelta::Millis(kDefaultHoldMs);
   std::vector<std::unique_ptr<Stream>> streams_ RTC_GUARDED_BY(mutex_);
   Mutex observer_mutex_;
@@ -354,6 +391,10 @@ class RTC_EXPORT SframeTransformer : public FrameTransformerInterface {
       const std::string& stream_id);
 
   SframeStreamStats GetStats() const;
+  // S-7: binds this (receive) transformer to `leg_index`, or unbinds it
+  // (nullopt); see SframeKeyStore::BindLeg. False on a sender or an
+  // unassignable leg index.
+  bool BindLeg(std::optional<uint32_t> leg_index);
   SframeRole role() const { return role_; }
   SframeMediaKind kind() const { return kind_; }
   const scoped_refptr<SframeKeyStore>& key_store() const { return store_; }

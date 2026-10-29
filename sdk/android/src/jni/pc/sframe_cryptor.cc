@@ -106,6 +106,8 @@ std::string StatsJson(const SframeStreamStats& s) {
   j += ",\"held\":" + std::to_string(s.held);
   j += ",\"heldReleased\":" + std::to_string(s.held_released);
   j += ",\"heldNow\":" + std::to_string(s.held_now);
+  j += ",\"boundLeg\":" + (s.bound_leg ? std::to_string(*s.bound_leg)
+                                       : std::string("null"));  // S-7
   j += ",\"lastKid\":" +
        (s.last_kid ? std::to_string(*s.last_kid) : std::string("null"));
   j += ",\"firstFrameAtMs\":" + (s.first_frame_at
@@ -196,6 +198,31 @@ static void JNI_SFrameKeyStore_SetHoldTime(JNIEnv* env,
                                            jlong j_store,
                                            jlong j_hold_ms) {
   Store(j_store)->SetHoldTime(TimeDelta::Millis(std::max<jlong>(0, j_hold_ms)));
+}
+
+static void JNI_SFrameKeyStore_SetRequireLegBinding(JNIEnv* env,
+                                                   jlong j_store,
+                                                   jboolean j_required) {
+  Store(j_store)->SetRequireLegBinding(j_required);
+}
+
+// S-7: legIndex < 0 = unbind.
+static std::optional<uint32_t> LegFromJava(jint j_leg_index) {
+  return j_leg_index < 0 ? std::nullopt
+                         : std::optional<uint32_t>(
+                               static_cast<uint32_t>(j_leg_index));
+}
+
+static jboolean JNI_SFrameKeyStore_BindLeg(
+    JNIEnv* env,
+    jlong j_store,
+    const JavaParamRef<jstring>& j_stream_id,
+    jint j_leg_index) {
+  if (j_stream_id.is_null()) {
+    return false;
+  }
+  return Store(j_store)->BindLeg(JavaToStdString(env, j_stream_id),
+                                 LegFromJava(j_leg_index));
 }
 
 static void JNI_SFrameKeyStore_SetObserver(
@@ -307,6 +334,13 @@ static jlong JNI_SFrameCryptor_CreateForRtpReceiver(
       KindFromIndex(j_kind), JavaToStdString(env, j_stream_id));
   receiver->SetFrameTransformer(t);
   return jlongFromPointer(t.release());
+}
+
+static jboolean JNI_SFrameCryptor_BindLeg(JNIEnv* env,
+                                          jlong j_cryptor,
+                                          jint j_leg_index) {
+  return reinterpret_cast<SframeTransformer*>(j_cryptor)->BindLeg(
+      LegFromJava(j_leg_index));
 }
 
 static ScopedJavaLocalRef<jstring> JNI_SFrameCryptor_GetStatsJson(

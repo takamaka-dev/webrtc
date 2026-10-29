@@ -121,6 +121,10 @@ const char* SframeDropReasonName(SframeDropReason reason) {
       return "held-expired";
     case SframeDropReason::kHeldOverflow:
       return "held-overflow";
+    case SframeDropReason::kUnbound:
+      return "unbound";
+    case SframeDropReason::kWrongLeg:
+      return "wrong-leg";
     case SframeDropReason::kCount:
       break;
   }
@@ -132,13 +136,17 @@ bool SframeDropCountsForStorm(SframeDropReason reason) {
   // 'short') + H.264 'malformed'.
   // C-24: a held frame whose key never came (or that overflowed the hold) is
   // an unknown-kid drop that waited.
+  // S-7 (ruling Q3): a frame this stream may not open (unbound, another leg's
+  // KID) is undecryptable for it — it counts.
   return reason == SframeDropReason::kBadTag ||
          reason == SframeDropReason::kUnknownKid ||
          reason == SframeDropReason::kBadHeader ||
          reason == SframeDropReason::kShort ||
          reason == SframeDropReason::kMalformed ||
          reason == SframeDropReason::kHeldExpired ||
-         reason == SframeDropReason::kHeldOverflow;
+         reason == SframeDropReason::kHeldOverflow ||
+         reason == SframeDropReason::kUnbound ||
+         reason == SframeDropReason::kWrongLeg;
 }
 
 const char* SframeEventTypeName(SframeEvent::Type type) {
@@ -365,6 +373,101 @@ void SframeKeyStore::SetObserver(scoped_refptr<SframeObserver> observer) {
 void SframeKeyStore::SetH264Enabled(bool enabled) {
   MutexLock lock(&mutex_);
   h264_enabled_ = enabled;
+}
+
+void SframeKeyStore::SetRequireLegBinding(bool required) {
+  MutexLock lock(&mutex_);
+  require_leg_binding_ = required;
+}
+
+bool SframeKeyStore::require_leg_binding() const {
+  MutexLock lock(&mutex_);
+  return require_leg_binding_;
+}
+
+bool SframeKeyStore::BindLeg(const std::string& stream_id,
+                             std::optional<uint32_t> leg_index) {
+  Events events;
+  bool found = false;
+  {
+    MutexLock lock(&mutex_);
+    for (auto& s : streams_) {
+      if (s->stats.role == SframeRole::kReceiver &&
+          s->stats.stream_id == stream_id) {
+        if (!BindLegLocked(s.get(), leg_index, &events)) {
+          return false;
+        }
+        found = true;
+      }
+    }
+  }
+  Dispatch(events);
+  return found;
+}
+
+bool SframeKeyStore::BindStreamLeg(Stream* stream,
+                                   std::optional<uint32_t> leg_index) {
+  Events events;
+  bool ok;
+  {
+    MutexLock lock(&mutex_);
+    ok = BindLegLocked(stream, leg_index, &events);
+  }
+  Dispatch(events);
+  return ok;
+}
+
+bool SframeKeyStore::BindLegLocked(Stream* stream,
+                                   std::optional<uint32_t> leg_index,
+                                   Events* events) {
+  if (stream->stats.role != SframeRole::kReceiver ||
+      (leg_index && (*leg_index == 0 || *leg_index > 0xFFFF))) {
+    return false;
+  }
+  SframeStreamStats& st = stream->stats;
+  if (st.bound_leg == leg_index) {
+    return true;  // re-bound to the same leg (every roster change): no-op
+  }
+  st.bound_leg = leg_index;
+  // Frames held under the old binding (C-24) are not known to be the new
+  // leg's: they go, counted as wrong-leg (outside the storm count, which
+  // restarts below).
+  while (!stream->held.empty()) {
+    stream->held_bytes -= stream->held.front().bytes;
+    st.held_now--;
+    st.dropped[static_cast<size_t>(SframeDropReason::kWrongLeg)]++;
+    stream->held.pop_front();
+  }
+  // The drops before this binding (unbound / another leg) say nothing about
+  // the new leg: a fresh storm count.
+  if (st.storm) {
+    SframeEvent e;
+    e.type = SframeEvent::Type::kResumed;
+    e.stream_id = st.stream_id;
+    e.role = st.role;
+    e.kind = st.kind;
+    events->push_back(e);
+  }
+  st.storm = false;
+  st.consecutive = 0;
+  return true;
+}
+
+std::optional<SframeDropReason> SframeKeyStore::LegCheckLocked(
+    const Stream* stream,
+    uint64_t kid) const {
+  const std::optional<uint32_t>& bound = stream->stats.bound_leg;
+  if (!bound) {
+    // S-7 / Q1: a store that requires the binding opens nothing for an
+    // unbound stream (the participant is not known to be in the verified
+    // roster yet, or left it).
+    return require_leg_binding_ ? std::optional(SframeDropReason::kUnbound)
+                                : std::nullopt;
+  }
+  if (sframe::LegIndexOf(kid) != *bound) {
+    return SframeDropReason::kWrongLeg;
+  }
+  return std::nullopt;
 }
 
 std::vector<uint8_t> SframeKeyStore::VectorSeal(
@@ -687,6 +790,11 @@ bool SframeKeyStore::ShouldHoldLocked(const Stream* stream,
     return false;
   }
   const uint32_t leg = sframe::LegIndexOf(kid);
+  // S-7: a bound stream holds only for its own leg (a frame of another leg
+  // never reaches here: OpenLocked drops it wrong-leg first).
+  if (stream->stats.bound_leg && *stream->stats.bound_leg != leg) {
+    return false;
+  }
   for (const auto& [k, e] : keys_) {
     if (sframe::LegIndexOf(k) != leg) {
       continue;
@@ -956,6 +1064,15 @@ bool SframeKeyStore::OpenLocked(Stream* stream,
       *why = SframeDropReason::kBadHeader;
       return false;
     }
+    // S-7: the binding is checked BEFORE the key lookup and before last_kid
+    // (which drives the hold and the storm recovery) is written: a frame of
+    // another leg never touches a replay window, the hold or this stream's
+    // KID history.
+    if (const std::optional<SframeDropReason> leg =
+            LegCheckLocked(stream, h->kid)) {
+      *why = *leg;
+      return false;
+    }
     stream->stats.last_kid = h->kid;
     KeyEntry* entry = FindKeyLocked(h->kid);
     if (entry == nullptr) {
@@ -1030,6 +1147,11 @@ bool SframeKeyStore::OpenLocked(Stream* stream,
     const std::optional<sframe::Header> h = sframe::ParseHeader(*unit);
     if (!h || unit->size() < h->length + sframe::kTagSize) {
       *why = h ? SframeDropReason::kShort : SframeDropReason::kBadHeader;
+      return false;
+    }
+    if (const std::optional<SframeDropReason> leg =
+            LegCheckLocked(stream, h->kid)) {
+      *why = *leg;  // S-7, as above
       return false;
     }
     stream->stats.last_kid = h->kid;
@@ -1110,6 +1232,10 @@ SframeTransformer::~SframeTransformer() {
 
 SframeStreamStats SframeTransformer::GetStats() const {
   return store_->StatsOf(stream_);
+}
+
+bool SframeTransformer::BindLeg(std::optional<uint32_t> leg_index) {
+  return store_->BindStreamLeg(stream_, leg_index);
 }
 
 scoped_refptr<TransformedFrameCallback> SframeTransformer::SinkFor(

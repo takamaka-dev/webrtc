@@ -103,6 +103,26 @@ public class SFrameKeyStore {
     nativeSetHoldTime(nativeKeyStore, holdMs);
   }
 
+  /**
+   * S-7 (ruling Q1): when on, a receive stream opens frames only after {@link #bindLeg} gave it a leg, and only under
+   * KIDs of that leg (kid >> 16); others drop as "unbound" / "wrong-leg" and count toward the storm (Q3). Off by
+   * default (the pre-tkm.9 behaviour). Set once, at creation, before frames flow.
+   */
+  public void setRequireLegBinding(boolean required) {
+    checkExists();
+    nativeSetRequireLegBinding(nativeKeyStore, required);
+  }
+
+  /**
+   * S-7: binds every receive stream labelled {@code streamId} to {@code legIndex} (1..65535), or unbinds it
+   * ({@code legIndex} &lt; 0). A change drops the frames the stream holds and restarts its storm count. False if no
+   * receive stream has that label or the index is reserved.
+   */
+  public boolean bindLeg(String streamId, int legIndex) {
+    checkExists();
+    return nativeBindLeg(nativeKeyStore, streamId, legIndex);
+  }
+
   public void setObserver(@Nullable Observer observer) {
     checkExists();
     nativeSetObserver(nativeKeyStore, observer);
@@ -152,6 +172,8 @@ public class SFrameKeyStore {
   private static native void nativeSetStormThreshold(long keyStore, int n);
   private static native void nativeSetH264Enabled(long keyStore, boolean enabled);
   private static native void nativeSetHoldTime(long keyStore, long holdMs);
+  private static native void nativeSetRequireLegBinding(long keyStore, boolean required);
+  private static native boolean nativeBindLeg(long keyStore, String streamId, int legIndex);
   private static native void nativeSetObserver(long keyStore, @Nullable Observer observer);
   private static native String nativeGetStatsJson(long keyStore);
   @Nullable
