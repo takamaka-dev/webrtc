@@ -252,9 +252,12 @@ SframeKeyStore::SetKeyResult SframeKeyStore::SetKey(
       entry.expires_at.reset();
       result = SetKeyResult::kChanged;
       // spec §9.2 [0.2]: a key arriving resumes a stormed subscription; every
-      // receive stream restarts its count.
+      // receive stream restarts its count — except an unbound stream that
+      // opens nothing (S-7): no key can recover it, only BindLeg, and a
+      // resumed / storm pair per epoch would flap the app's subscription.
       for (auto& s : streams_) {
-        if (s->stats.role != SframeRole::kReceiver) {
+        if (s->stats.role != SframeRole::kReceiver ||
+            ClosedUnboundLocked(s.get())) {
           continue;
         }
         if (s->stats.storm) {
@@ -377,7 +380,9 @@ void SframeKeyStore::SetH264Enabled(bool enabled) {
 
 void SframeKeyStore::SetRequireLegBinding(bool required) {
   MutexLock lock(&mutex_);
-  require_leg_binding_ = required;
+  // One-way latch (tkm.10, R2): once required, always required. With the
+  // default on, `false` is never honoured.
+  require_leg_binding_ = require_leg_binding_ || required;
 }
 
 bool SframeKeyStore::require_leg_binding() const {
@@ -429,6 +434,10 @@ bool SframeKeyStore::BindLegLocked(Stream* stream,
     return true;  // re-bound to the same leg (every roster change): no-op
   }
   st.bound_leg = leg_index;
+  if (leg_index) {
+    stream->ever_bound = true;  // from now on unbound = closed, whatever the
+                                // store's flag says (tkm.10)
+  }
   // Frames held under the old binding (C-24) are not known to be the new
   // leg's: they go, counted as wrong-leg (outside the storm count, which
   // restarts below).
@@ -460,14 +469,25 @@ std::optional<SframeDropReason> SframeKeyStore::LegCheckLocked(
   if (!bound) {
     // S-7 / Q1: a store that requires the binding opens nothing for an
     // unbound stream (the participant is not known to be in the verified
-    // roster yet, or left it).
-    return require_leg_binding_ ? std::optional(SframeDropReason::kUnbound)
-                                : std::nullopt;
+    // roster yet, or left it); nor does a stream that was bound once.
+    return ClosedUnboundLocked(stream)
+               ? std::optional(SframeDropReason::kUnbound)
+               : std::nullopt;
   }
-  if (sframe::LegIndexOf(kid) != *bound) {
+  // The full 64-bit leg (kid >> 16), not LegIndexOf's 32-bit truncation: a
+  // wire KID of 2^48 or more (a leg index wider than 16 bits, which no key
+  // can ever carry) is nobody's leg, so it is wrong-leg — never an alias of
+  // the bound leg that goes on to the key lookup and into last_kid.
+  if (!sframe::IsAssignableKid(kid) || (kid >> 16) != uint64_t{*bound}) {
     return SframeDropReason::kWrongLeg;
   }
   return std::nullopt;
+}
+
+bool SframeKeyStore::ClosedUnboundLocked(const Stream* stream) const {
+  return stream->stats.role == SframeRole::kReceiver &&
+         !stream->stats.bound_leg &&
+         (require_leg_binding_ || stream->ever_bound);
 }
 
 std::vector<uint8_t> SframeKeyStore::VectorSeal(
@@ -603,7 +623,7 @@ void SframeKeyStore::RecordNoSink(Stream* stream,
   MutexLock lock(&mutex_);
   stream->stats.frames++;
   stream->stats.bytes_in += bytes;
-  DropLocked(stream, SframeDropReason::kNoSink, events);
+  DropLocked(stream, SframeDropReason::kNoSink, std::nullopt, events);
 }
 
 SframeKeyStore::KeyEntry* SframeKeyStore::FindKeyLocked(uint64_t kid) {
@@ -642,6 +662,7 @@ void SframeKeyStore::SampleDrop(Stream* stream,
 
 void SframeKeyStore::DropLocked(Stream* stream,
                                 SframeDropReason why,
+                                std::optional<uint64_t> kid,
                                 Events* events) {
   SframeStreamStats& st = stream->stats;
   st.dropped[static_cast<size_t>(why)]++;
@@ -653,7 +674,8 @@ void SframeKeyStore::DropLocked(Stream* stream,
     e.role = st.role;
     e.kind = st.kind;
     e.reason = why;
-    e.kid = st.last_kid;
+    e.kid = kid;  // the dropped frame's, not last_kid (which an unbound /
+                  // wrong-leg frame never writes)
     events->push_back(e);
   }
   if (st.role != SframeRole::kReceiver || !SframeDropCountsForStorm(why)) {
@@ -669,7 +691,7 @@ void SframeKeyStore::DropLocked(Stream* stream,
     e.role = st.role;
     e.kind = st.kind;
     e.reason = why;
-    e.kid = st.last_kid;
+    e.kid = kid;
     e.consecutive = st.consecutive;
     events->push_back(e);
   }
@@ -709,15 +731,21 @@ bool SframeKeyStore::Process(Stream* stream,
           ? TransformableFrameInterface::Direction::kSender
           : TransformableFrameInterface::Direction::kReceiver;
   if (frame.GetDirection() != expected) {
-    DropLocked(stream, SframeDropReason::kInternal, events);
+    DropLocked(stream, SframeDropReason::kInternal, std::nullopt, events);
     SampleDrop(stream, SframeDropReason::kInternal, data);
     return false;
   }
   SframeDropReason why = SframeDropReason::kInternal;
-  uint64_t kid = 0;
-  const bool ok = st.role == SframeRole::kSender
-                      ? SealLocked(stream, frame, out, &why)
-                      : OpenLocked(stream, frame, out, &why, &kid);
+  // The frame's KID: the send KID, or the received header's once it was read
+  // (also when the frame then drops: the events carry it).
+  std::optional<uint64_t> kid;
+  bool ok;
+  if (st.role == SframeRole::kSender) {
+    kid = send_kid_;
+    ok = SealLocked(stream, frame, out, &why);
+  } else {
+    ok = OpenLocked(stream, frame, out, &why, &kid);
+  }
   if (!ok) {
     out->clear();
     if (why == SframeDropReason::kUnknownKid && st.last_kid &&
@@ -728,11 +756,12 @@ bool SframeKeyStore::Process(Stream* stream,
       *held = true;
       return false;
     }
-    DropLocked(stream, why, events);
+    DropLocked(stream, why, kid, events);
     SampleDrop(stream, why, data);
     return false;
   }
-  PassLocked(stream, kid, out->size(), events);
+  RTC_DCHECK(kid.has_value());
+  PassLocked(stream, *kid, out->size(), events);
   return true;
 }
 
@@ -761,10 +790,12 @@ void SframeKeyStore::PassLocked(Stream* stream,
     // receive stream whose last frames carried that KID (e.g. the paused video
     // of a leg whose audio now opens) may resume — spec §9.2 [0.2], the web
     // worker's recovered(): the fix may have been on the sender's side, so no
-    // key event ever arrives here.
+    // key event ever arrives here. Not an unbound stream that opens nothing
+    // (S-7): only BindLeg brings it back (as in SetKey).
     for (auto& s : streams_) {
       if (s->stats.role == SframeRole::kReceiver && s->stats.storm &&
-          (s.get() == stream || s->stats.last_kid == kid)) {
+          (s.get() == stream || s->stats.last_kid == kid) &&
+          !ClosedUnboundLocked(s.get())) {
         s->stats.storm = false;
         s->stats.consecutive = 0;
         SframeEvent e;
@@ -820,7 +851,7 @@ void SframeKeyStore::HoldLocked(Stream* stream,
     HeldFrame& old = stream->held.front();
     stream->held_bytes -= old.bytes;
     st.held_now--;
-    DropLocked(stream, SframeDropReason::kHeldOverflow, events);
+    DropLocked(stream, SframeDropReason::kHeldOverflow, old.kid, events);
     SampleDrop(stream, SframeDropReason::kHeldOverflow, old.frame->GetData());
     stream->held.pop_front();
   }
@@ -863,10 +894,10 @@ void SframeKeyStore::ReleaseHeldLocked(uint64_t kid,
       s->stats.held_now--;
       std::vector<uint8_t> out;
       SframeDropReason why = SframeDropReason::kInternal;
-      uint64_t opened_kid = 0;
+      std::optional<uint64_t> opened_kid;
       const bool ok = OpenLocked(s.get(), *h.frame, &out, &why, &opened_kid);
       if (!ok) {
-        DropLocked(s.get(), why, events);
+        DropLocked(s.get(), why, h.kid, events);
         SampleDrop(s.get(), why, h.frame->GetData());
         continue;
       }
@@ -874,11 +905,11 @@ void SframeKeyStore::ReleaseHeldLocked(uint64_t kid,
           s->transformer ? s->transformer->SinkFor(h.frame->GetSsrc())
                          : nullptr;
       if (!sink) {
-        DropLocked(s.get(), SframeDropReason::kNoSink, events);
+        DropLocked(s.get(), SframeDropReason::kNoSink, h.kid, events);
         continue;
       }
       h.frame->SetData(out);
-      PassLocked(s.get(), opened_kid, out.size(), events);
+      PassLocked(s.get(), opened_kid.value_or(h.kid), out.size(), events);
       s->stats.held_released++;
       released++;
       deliveries->push_back(Delivery{std::move(sink), std::move(h.frame)});
@@ -905,7 +936,7 @@ void SframeKeyStore::ExpireHeldLocked(Events* events) {
       HeldFrame& h = s->held.front();
       s->held_bytes -= h.bytes;
       s->stats.held_now--;
-      DropLocked(s.get(), SframeDropReason::kHeldExpired, events);
+      DropLocked(s.get(), SframeDropReason::kHeldExpired, h.kid, events);
       SampleDrop(s.get(), SframeDropReason::kHeldExpired,
                  h.frame->GetData());
       s->held.pop_front();
@@ -1037,7 +1068,10 @@ bool SframeKeyStore::OpenLocked(Stream* stream,
                                 const TransformableFrameInterface& frame,
                                 std::vector<uint8_t>* out,
                                 SframeDropReason* why,
-                                uint64_t* kid_out) {
+                                std::optional<uint64_t>* kid_out) {
+  // `*kid_out` = the frame's KID from the moment a header was read, so a
+  // drop after that point (unbound, wrong-leg, unknown-kid, bad tag, ...)
+  // still names it in the events.
   const std::span<const uint8_t> data = frame.GetData();
   if (data.empty()) {
     // Padding-only RTP packets (bandwidth probing) reach the audio receive
@@ -1064,6 +1098,7 @@ bool SframeKeyStore::OpenLocked(Stream* stream,
       *why = SframeDropReason::kBadHeader;
       return false;
     }
+    *kid_out = h->kid;
     // S-7: the binding is checked BEFORE the key lookup and before last_kid
     // (which drives the hold and the storm recovery) is written: a frame of
     // another leg never touches a replay window, the hold or this stream's
@@ -1100,7 +1135,6 @@ bool SframeKeyStore::OpenLocked(Stream* stream,
       return false;
     }
     entry->window.Commit(h->ctr);  // only after the tag verified
-    *kid_out = h->kid;
     return true;
   }
 
@@ -1148,6 +1182,9 @@ bool SframeKeyStore::OpenLocked(Stream* stream,
     if (!h || unit->size() < h->length + sframe::kTagSize) {
       *why = h ? SframeDropReason::kShort : SframeDropReason::kBadHeader;
       return false;
+    }
+    if (!frame_kid) {
+      *kid_out = h->kid;  // the first sealed slice names the frame
     }
     if (const std::optional<SframeDropReason> leg =
             LegCheckLocked(stream, h->kid)) {
@@ -1200,7 +1237,7 @@ bool SframeKeyStore::OpenLocked(Stream* stream,
   for (uint64_t ctr : ctrs) {
     entry->window.Commit(ctr);
   }
-  *kid_out = *frame_kid;
+  *kid_out = frame_kid;
   return true;
 }
 

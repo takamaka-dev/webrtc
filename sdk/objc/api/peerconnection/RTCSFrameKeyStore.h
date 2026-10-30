@@ -90,8 +90,10 @@ RTC_OBJC_EXPORT
 
 /**
  * S-7 (ruling Q1): when YES, a receive stream opens frames only after -bindLeg:streamId: gave it a leg, and only
- * under KIDs of that leg (kid >> 16); others drop as "unbound" / "wrong-leg" and count toward the storm (Q3). NO by
- * default (the pre-tkm.9 behaviour). Set once, at creation, before frames flow.
+ * under KIDs of that leg (kid >> 16); others drop as "unbound" / "wrong-leg" and count toward the storm (Q3). YES by
+ * default since tkm.10 (Iris §7.117 item 2, ruling R2) and a one-way latch: `setRequireLegBinding:NO` is ignored once
+ * the flag is on — so, with the default, always; `YES` is a no-op kept for the callers of tkm.9. Independently of the
+ * flag, a stream that was ever bound treats a later unbind as closed ("unbound"), never as "open any KID".
  */
 - (void)setRequireLegBinding:(BOOL)required;
 

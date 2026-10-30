@@ -105,8 +105,11 @@ public class SFrameKeyStore {
 
   /**
    * S-7 (ruling Q1): when on, a receive stream opens frames only after {@link #bindLeg} gave it a leg, and only under
-   * KIDs of that leg (kid >> 16); others drop as "unbound" / "wrong-leg" and count toward the storm (Q3). Off by
-   * default (the pre-tkm.9 behaviour). Set once, at creation, before frames flow.
+   * KIDs of that leg (kid >> 16); others drop as "unbound" / "wrong-leg" and count toward the storm (Q3). ON by
+   * default since tkm.10 (Iris §7.117 item 2, ruling R2) and a one-way latch: {@code setRequireLegBinding(false)} is
+   * ignored once the flag is on — so, with the default, always; passing {@code true} is a no-op kept for the callers
+   * of tkm.9. Independently of the flag, a stream that was ever bound treats a later unbind as closed ("unbound"),
+   * never as "open any KID".
    */
   public void setRequireLegBinding(boolean required) {
     checkExists();
